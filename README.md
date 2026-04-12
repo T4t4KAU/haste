@@ -157,6 +157,123 @@ python -O bench.py \
     --auto-tune-kf
 ```
 
+### server.py
+
+The `server.py` script starts a lightweight HTTP service around a single loaded Haste engine instance. It uses only the Python standard library for the web layer, so there are no extra serving dependencies beyond the core runtime stack.
+
+#### Command Line Arguments
+
+- `--host`: Host to bind the server (default: `0.0.0.0`)
+- `--port`: Port to bind the server (default: `8000`)
+- `--mode`: Decoding mode: `ar`, `spec_sync`, or `spec_async` (default: `spec_async`)
+- `--target-model-path`: Path to the target model (required)
+- `--draft-model-path`: Path to the draft model. Required for `spec_sync` and `spec_async`
+- `--max-num-seqs`: Maximum number of concurrent sequences (default: `32`)
+- `--max-num-batched-tokens`: Maximum number of batched tokens for the scheduler (default: `4096`)
+- `--max-model-len`: Maximum model length (default: `4096`)
+- `--default-max-new-tokens`: Default generation length when the request does not override it (default: `128`)
+- `--speculate-k`: Number of tokens to speculate (default: `7`)
+- `--async-fan-out`: Number of async draft runners (default: `3`)
+- `--auto-tune-kf`: Dynamically search and adjust speculative lookahead/fan-out at runtime
+- `--enforce-eager`: Disable CUDA graph capture and force eager mode
+- `--verbose`: Enable verbose runtime logs
+
+#### Example Usage
+
+Start an async speculative server:
+
+```bash
+python -O server.py \
+    --mode spec_async \
+    --target-model-path /path/to/Qwen3-32B \
+    --draft-model-path /path/to/Qwen3-0.6B \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+Start an autoregressive server:
+
+```bash
+python -O server.py \
+    --mode ar \
+    --target-model-path /path/to/Qwen3-32B \
+    --port 8000
+```
+
+#### Available Endpoints
+
+- `GET /health`: Health check and currently loaded model metadata
+- `GET /v1/models`: Model metadata in a simple OpenAI-style list response
+- `POST /v1/generate`: Raw prompt generation endpoint
+- `POST /v1/chat/completions`: OpenAI-style chat completion endpoint
+
+#### `POST /v1/generate`
+
+Single prompt request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "prompt": "Explain speculative decoding in one paragraph.",
+        "temperature": 0.0,
+        "max_new_tokens": 64,
+        "return_metrics": true
+    }'
+```
+
+Batch request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "prompts": [
+            "What is speculative decoding?",
+            "What is asynchronous verification?"
+        ],
+        "sampling_params": [
+            {"temperature": 0.0, "max_new_tokens": 64},
+            {"temperature": 0.2, "max_new_tokens": 96}
+        ]
+    }'
+```
+
+The request body may include one of:
+
+- `prompt`: Single string prompt
+- `prompts`: Batch of string prompts
+- `prompt_token_ids`: Single prompt already tokenized as a list of integers
+- `prompt_token_ids_batch`: Batch of tokenized prompts
+
+Sampling parameters may be provided either:
+
+- At the top level with `temperature`, `draft_temperature`, `max_new_tokens`, and `ignore_eos`
+- Via `sampling_params` as a single object applied to all prompts
+- Via `sampling_params` as a per-prompt list matching the batch size
+
+#### `POST /v1/chat/completions`
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "messages": [
+            {"role": "system", "content": "You are a concise assistant."},
+            {"role": "user", "content": "Explain Haste in two sentences."}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 64,
+        "return_metrics": true
+    }'
+```
+
+Notes:
+
+- `stream=true` is currently not supported by `server.py`
+- The service serializes generation requests through a single loaded engine instance, which keeps inference state safe
+- `return_metrics=true` adds a summarized per-request profiling report to the JSON response
+
 ## Output
 
 Both scripts generate detailed metrics about the inference process, including:

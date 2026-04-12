@@ -224,6 +224,7 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
         stream_callback=None,
+        log_metrics: bool = True,
     ):
         """Generate responses for the given prompts.
         
@@ -232,6 +233,7 @@ class LLMEngine:
             sampling_params (SamplingParams | list[SamplingParams]): Sampling parameters
             use_tqdm (bool, optional): Whether to use progress bar. Defaults to True.
             stream_callback (callable, optional): Callback for streaming output. Defaults to None.
+            log_metrics (bool, optional): Whether to print metrics after generation. Defaults to True.
             
         Returns:
             tuple[list[dict], dict]: List of generated outputs and metrics
@@ -310,7 +312,7 @@ class LLMEngine:
         formatted = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in ordered]
 
         # Log metrics if not streaming
-        if stream_callback is None:
+        if stream_callback is None and log_metrics:
             self.log_metrics()
         return formatted, METRICS
 
