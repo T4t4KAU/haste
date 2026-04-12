@@ -35,6 +35,8 @@ def print_profile_summary(report: dict):
     acceptance = report["acceptance"]
     stages = report["stages"]
     runners = report["runners"]
+    metadata = report.get("metadata", {})
+    mode = metadata.get("mode", "spec_async")
 
     print("\nProfiling Summary")
     print("-" * 50)
@@ -46,9 +48,9 @@ def print_profile_summary(report: dict):
         print(f"Overall throughput: {throughput['overall_tok_per_s']:.2f} tok/s")
     if throughput["generation_tok_per_s"] is not None:
         print(f"Generation throughput: {throughput['generation_tok_per_s']:.2f} tok/s")
-    if cache["avg_hit_rate"] is not None:
+    if mode == "spec_async" and cache["avg_hit_rate"] is not None:
         print(f"Average cache hit rate: {cache['avg_hit_rate']:.2%}")
-    if acceptance["avg_accepted_spec_fraction"] is not None:
+    if mode in {"spec_sync", "spec_async"} and acceptance["avg_accepted_spec_fraction"] is not None:
         print(f"Accepted speculative fraction: {acceptance['avg_accepted_spec_fraction']:.2%}")
 
     print_series_summary("Engine step", stages["engine_step_ms"], "ms")
@@ -57,7 +59,7 @@ def print_profile_summary(report: dict):
     print_series_summary("Postprocess", stages["postprocess_ms"], "ms")
 
     draft_worker = runners.get("draft_worker", {})
-    if draft_worker:
+    if mode == "spec_async" and draft_worker:
         if draft_worker.get("auto_tune_enabled"):
             print(
                 "Auto-tuned K/F: "
@@ -82,14 +84,20 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run inference with Haste LLM engine.",
     )
     parser.add_argument(
+        "--mode",
+        choices=("ar", "spec_sync", "spec_async"),
+        default="spec_async",
+        help="Decoding mode: autoregressive (`ar`), synchronous speculative (`spec_sync`), or asynchronous speculative (`spec_async`).",
+    )
+    parser.add_argument(
         "--target-model-path",
         required=True,
         help="Path to the target model.",
     )
     parser.add_argument(
         "--draft-model-path",
-        required=True,
-        help="Path to the draft model.",
+        default="",
+        help="Path to the draft model. Required for speculative modes.",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -143,9 +151,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     return parser
 
+
+def validate_mode_args(args: argparse.Namespace) -> None:
+    """Validate command line argument combinations."""
+    if args.mode in {"spec_sync", "spec_async"} and not args.draft_model_path:
+        raise ValueError("--draft-model-path is required when --mode is spec_sync or spec_async.")
+    if args.auto_tune_kf and args.mode != "spec_async":
+        raise ValueError("--auto-tune-kf is only supported when --mode is spec_async.")
+
+
+def build_llm_kwargs(args: argparse.Namespace) -> dict:
+    """Build LLM keyword arguments from command line arguments."""
+    speculate = args.mode != "ar"
+    draft_async = args.mode == "spec_async"
+    kwargs = {
+        "model": args.target_model_path,
+        "speculate": speculate,
+        "speculate_k": args.speculate_k,
+        "draft_async": draft_async,
+        "async_fan_out": args.async_fan_out,
+        "async_auto_tune": args.auto_tune_kf,
+        "verbose": args.verbose,
+        "max_num_seqs": 32,
+        "max_num_batched_tokens": 4096,
+        "max_model_len": 4096,
+        "enforce_eager": False,
+    }
+    if speculate:
+        kwargs["draft_model"] = args.draft_model_path
+    return kwargs
+
 def main():
     """Main function to run inference with Haste LLM engine."""
     args = build_parser().parse_args()
+    validate_mode_args(args)
     prompts = [
         "Peking University is",
         "The capital of France is",
@@ -159,20 +198,7 @@ def main():
     )
 
     print("Initializing LLM...")
-    llm = LLM(
-        model=args.target_model_path,
-        draft_model=args.draft_model_path,
-        speculate=True,
-        speculate_k=args.speculate_k,
-        draft_async=True,
-        async_fan_out=args.async_fan_out,
-        async_auto_tune=args.auto_tune_kf,
-        verbose=args.verbose,
-        max_num_seqs=32,
-        max_num_batched_tokens=4096,
-        max_model_len=4096,
-        enforce_eager=False,
-    )
+    llm = LLM(**build_llm_kwargs(args))
     print("LLM initialized successfully!")
 
     try:
@@ -195,8 +221,9 @@ def main():
             requested_new_tokens=requested_new_tokens,
             speculate_k=args.speculate_k,
             metadata={
+                "mode": args.mode,
                 "target_model_path": args.target_model_path,
-                "draft_model_path": args.draft_model_path,
+                "draft_model_path": args.draft_model_path if args.mode != "ar" else None,
                 "prompt_count": len(prompts),
                 "max_new_tokens": args.max_new_tokens,
                 "temperature": args.temperature,
@@ -208,6 +235,7 @@ def main():
             },
             include_raw_metrics=args.include_raw_metrics,
         )
+        print(f"Mode: {args.mode}")
         print_profile_summary(profile_report)
 
         if args.profile_output:

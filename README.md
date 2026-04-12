@@ -26,13 +26,15 @@ The `example.py` script demonstrates basic usage of the Haste engine with a few 
 #### Command Line Arguments
 
 - `--target-model-path`: Path to the target model (required)
-- `--draft-model-path`: Path to the draft model (required)
+- `--mode`: Decoding mode: `ar`, `spec_sync`, or `spec_async` (default: `spec_async`)
+- `--draft-model-path`: Path to the draft model. Required for `spec_sync` and `spec_async`
 - `--max-new-tokens`: Maximum number of new tokens to generate (default: 128)
 - `--temperature`: Sampling temperature for target model (default: 0.0)
 - `--draft-temperature`: Sampling temperature for draft model (default: 0.0)
 - `--speculate-k`: Number of tokens to speculate (default: 7)
 - `--async-fan-out`: Number of async draft runners (default: 3)
 - `--auto-tune-kf`: Dynamically search and adjust speculative lookahead/fan-out at runtime
+- `--verbose`: Enable detailed runtime logs, including auto-tune K/F transitions
 - `--profile-output`: Optional JSON file for the profiling report
 - `--include-raw-metrics`: Include raw per-step metric series in the profiling report
 
@@ -40,16 +42,26 @@ The `example.py` script demonstrates basic usage of the Haste engine with a few 
 
 ```bash
 python -O example.py \
+    --mode spec_async \
     --target-model-path /path/to/Qwen3-32B \
     --draft-model-path /path/to/Qwen3-0.6B \
     --auto-tune-kf \
     --profile-output outputs/example_profile.json
 ```
 
-Example with local ModelScope directories:
+Autoregressive comparison:
 
 ```bash
 python -O example.py \
+    --mode ar \
+    --target-model-path /path/to/models/Qwen3-32B
+```
+
+Synchronous speculative decoding comparison:
+
+```bash
+python -O example.py \
+    --mode spec_sync \
     --target-model-path /path/to/models/Qwen3-32B \
     --draft-model-path /path/to/models/Qwen3-0.6B
 ```
@@ -61,7 +73,8 @@ The `bench.py` script benchmarks Haste on real prompts and now emits both throug
 #### Command Line Arguments
 
 - `--target-model-path`: Path to the target model (required)
-- `--draft-model-path`: Path to the draft model (required)
+- `--mode`: Decoding mode: `ar`, `spec_sync`, or `spec_async` (default: `spec_async`)
+- `--draft-model-path`: Path to the draft model. Required for `spec_sync` and `spec_async`
 - `--dataset-root`: Root directory for datasets 
 - `--datasets`: Comma-separated dataset names under dataset-root, or `all` (default: `alpaca,gsm8k,humaneval,mt_bench_1,qa,sum`)
 - `--dataset-file`: Optional explicit JSONL file. Overrides `--datasets`
@@ -74,6 +87,7 @@ The `bench.py` script benchmarks Haste on real prompts and now emits both throug
 - `--speculate-k`: Number of tokens to speculate (default: 7)
 - `--async-fan-out`: Number of async draft runners (default: 3)
 - `--auto-tune-kf`: Dynamically search and adjust speculative lookahead/fan-out at runtime
+- `--verbose`: Enable detailed runtime logs, including auto-tune K/F transitions
 - `--max-model-len`: Maximum model length (default: 4096)
 - `--warmup-runs`: Number of warmup runs (default: 1)
 - `--turn-index`: Which item from `turns` to use when a prompt file is multi-turn (default: 0)
@@ -89,6 +103,7 @@ The `bench.py` script benchmarks Haste on real prompts and now emits both throug
 
 ```bash
 python -O bench.py \
+    --mode spec_async \
     --target-model-path /path/to/Qwen3-32B \
     --draft-model-path /path/to/Qwen3-0.6B \
     --dataset-root /path/to/datasets \
@@ -100,10 +115,38 @@ python -O bench.py \
     --profile-output outputs/bench_profile.json
 ```
 
-Example with local ModelScope directories:
+Autoregressive comparison:
 
 ```bash
 python -O bench.py \
+    --mode ar \
+    --target-model-path /path/to/models/Qwen3-32B \
+    --dataset-root ./datasets \
+    --datasets alpaca,gsm8k \
+    --prompt-limit 20 \
+    --max-num-seqs 8 \
+    --max-new-tokens 128
+```
+
+Synchronous speculative decoding comparison:
+
+```bash
+python -O bench.py \
+    --mode spec_sync \
+    --target-model-path /path/to/models/Qwen3-32B \
+    --draft-model-path /path/to/models/Qwen3-0.6B \
+    --dataset-root ./datasets \
+    --datasets alpaca,gsm8k \
+    --prompt-limit 20 \
+    --max-num-seqs 8 \
+    --max-new-tokens 128
+```
+
+Asynchronous speculative decoding with auto-tuning:
+
+```bash
+python -O bench.py \
+    --mode spec_async \
     --target-model-path /path/to/models/Qwen3-32B \
     --draft-model-path /path/to/models/Qwen3-0.6B \
     --dataset-root ./datasets \
@@ -121,10 +164,11 @@ Both scripts generate detailed metrics about the inference process, including:
 - Prefill throughput (tokens/second)
 - Decode throughput (tokens/second)
 - Overall throughput (tokens/second)
-- Average cache hit rate
-- Speculative token acceptance rate
+- Average cache hit rate for `spec_async`
+- Speculative token acceptance rate for `spec_sync` and `spec_async`
 - Mean / p50 / p95 stage latency for scheduling, speculation, verification, rollback, and post-processing
-- Target runner and draft worker timing breakdowns
+- Target runner timing breakdowns
+- Draft worker timing breakdowns for `spec_async`
 - Wall time
 - Total processed tokens
 - Requested new tokens
@@ -196,12 +240,12 @@ python -O bench.py \
 The profiling summary is organized into these parts:
 
 - `throughput`: prefill, decode, overall, and generation throughput
-- `cache`: asynchronous cache hit statistics
-- `acceptance`: speculative acceptance statistics
+- `cache`: asynchronous cache hit statistics for `spec_async`
+- `acceptance`: speculative acceptance statistics for `spec_sync` and `spec_async`
 - `stages`: engine-level timing for scheduler, speculate, verify, rollback, and postprocess
 - `runners.target`: target runner timing split into prepare, model, sample, and total
-- `runners.draft_model`: draft model timing split into prepare, model, sample, and total
-- `runners.draft_worker`: async worker timing such as request wait, serve, and cache population
+- `runners.draft_model`: draft model timing split into prepare, model, sample, and total for speculative modes
+- `runners.draft_worker`: async worker timing such as request wait, serve, and cache population for `spec_async`
 
 Latency summaries are reported as `mean`, `p50`, `p95`, and `max`.
 

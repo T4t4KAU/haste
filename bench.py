@@ -31,8 +31,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Benchmark haste on real prompts from the HCSD/Dovetail datasets.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("ar", "spec_sync", "spec_async"),
+        default="spec_async",
+        help="Decoding mode: autoregressive (`ar`), synchronous speculative (`spec_sync`), or asynchronous speculative (`spec_async`).",
+    )
     parser.add_argument("--target-model-path", required=True, help="Path to the target model.")
-    parser.add_argument("--draft-model-path", required=True, help="Path to the draft model.")
+    parser.add_argument("--draft-model-path", default="", help="Path to the draft model. Required for speculative modes.")
     parser.add_argument("--dataset-root", required=True,help="Root directory for datasets.")
     parser.add_argument(
         "--datasets",
@@ -117,6 +123,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include raw per-step metric series in the JSON profiling report.",
     )
     return parser
+
+
+def validate_mode_args(args: argparse.Namespace) -> None:
+    """Validate command line argument combinations."""
+    if args.mode in {"spec_sync", "spec_async"} and not args.draft_model_path:
+        raise ValueError("--draft-model-path is required when --mode is spec_sync or spec_async.")
+    if args.auto_tune_kf and args.mode != "spec_async":
+        raise ValueError("--auto-tune-kf is only supported when --mode is spec_async.")
+
+
+def build_llm_kwargs(args: argparse.Namespace, cfg: dict[str, int]) -> dict[str, Any]:
+    """Build LLM keyword arguments from command line arguments."""
+    speculate = args.mode != "ar"
+    draft_async = args.mode == "spec_async"
+    kwargs: dict[str, Any] = {
+        "model": args.target_model_path,
+        "speculate": speculate,
+        "speculate_k": args.speculate_k,
+        "draft_async": draft_async,
+        "async_fan_out": args.async_fan_out,
+        "async_auto_tune": args.auto_tune_kf,
+        "verbose": args.verbose,
+        "enforce_eager": args.enforce_eager,
+        "max_num_seqs": args.max_num_seqs or cfg["max_num_seqs"],
+        "max_num_batched_tokens": args.max_num_batched_tokens or cfg["max_num_batched_tokens"],
+        "max_model_len": args.max_model_len,
+    }
+    if speculate:
+        kwargs["draft_model"] = args.draft_model_path
+    return kwargs
 
 
 def pick_benchmark_config() -> dict[str, int]:
@@ -347,6 +383,8 @@ def print_profile_summary(report: dict[str, Any]) -> None:
     acceptance = report["acceptance"]
     stages = report["stages"]
     runners = report["runners"]
+    metadata = report.get("metadata", {})
+    mode = metadata.get("mode", "spec_async")
 
     print("\nProfiling Summary")
     print("-" * 60)
@@ -358,9 +396,9 @@ def print_profile_summary(report: dict[str, Any]) -> None:
         print(f"Overall throughput: {throughput['overall_tok_per_s']:.2f} tok/s")
     if throughput["generation_tok_per_s"] is not None:
         print(f"Generation throughput: {throughput['generation_tok_per_s']:.2f} tok/s")
-    if cache["avg_hit_rate"] is not None:
+    if mode == "spec_async" and cache["avg_hit_rate"] is not None:
         print(f"Average cache hit rate: {cache['avg_hit_rate']:.2%}")
-    if acceptance["avg_accepted_spec_fraction"] is not None:
+    if mode in {"spec_sync", "spec_async"} and acceptance["avg_accepted_spec_fraction"] is not None:
         print(f"Accepted speculative fraction: {acceptance['avg_accepted_spec_fraction']:.2%}")
 
     print_series_summary("Engine step", stages["engine_step_ms"], "ms")
@@ -376,7 +414,7 @@ def print_profile_summary(report: dict[str, Any]) -> None:
         print_series_summary("Target verify runner", target_verify.get("time_ms", {}), "ms")
 
     draft_worker = runners.get("draft_worker", {})
-    if draft_worker:
+    if mode == "spec_async" and draft_worker:
         if draft_worker.get("auto_tune_enabled"):
             print(
                 "Auto-tuned K/F: "
@@ -397,24 +435,12 @@ def print_profile_summary(report: dict[str, Any]) -> None:
 def main():
     """Main function to run benchmarking."""
     args = build_parser().parse_args()
+    validate_mode_args(args)
     dataset_root = Path(args.dataset_root).expanduser().resolve()
     dataset_files = resolve_dataset_files(dataset_root, args.datasets, args.dataset_file)
     cfg = pick_benchmark_config()
 
-    llm = LLM(
-        model=args.target_model_path,
-        draft_model=args.draft_model_path,
-        speculate=True,
-        speculate_k=args.speculate_k,
-        draft_async=True,
-        async_fan_out=args.async_fan_out,
-        async_auto_tune=args.auto_tune_kf,
-        verbose=args.verbose,
-        enforce_eager=args.enforce_eager,
-        max_num_seqs=args.max_num_seqs or cfg["max_num_seqs"],
-        max_num_batched_tokens=args.max_num_batched_tokens or cfg["max_num_batched_tokens"],
-        max_model_len=args.max_model_len,
-    )
+    llm = LLM(**build_llm_kwargs(args, cfg))
 
     try:
         records = load_prompt_records(
@@ -479,8 +505,9 @@ def main():
         requested_new_tokens=requested_new_tokens,
         speculate_k=args.speculate_k,
         metadata={
+            "mode": args.mode,
             "target_model_path": args.target_model_path,
-            "draft_model_path": args.draft_model_path,
+            "draft_model_path": args.draft_model_path if args.mode != "ar" else None,
             "dataset_files": [str(path) for path in dataset_files],
             "dataset_mix": dict(dataset_counts),
             "prompt_count": len(records),
@@ -505,6 +532,7 @@ def main():
 
     print("\nBenchmark Summary")
     print("-" * 60)
+    print(f"Mode: {args.mode}")
     print(f"Dataset files: {', '.join(str(path) for path in dataset_files)}")
     print(f"Loaded prompts: {len(records)}")
     print(f"Dataset mix: {dict(dataset_counts)}")
