@@ -26,6 +26,10 @@ DEFAULT_CANDIDATE_BASE_URL = "http://127.0.0.1:8000/v1"
 DEFAULT_CANDIDATE_MODEL = "haste-local"
 DEFAULT_JUDGE_PROMPT_FILE = "datasets/judge_prompts.jsonl"
 DEFAULT_OUTPUT_PATH = "outputs/eval_results.json"
+CANDIDATE_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Provide only the final answer to the user. "
+    "Do not output hidden reasoning, chain-of-thought, or any `<think>` tags."
+)
 
 SCORE_PATTERN = re.compile(r"\[\[(\d+)\]\]")
 
@@ -418,7 +422,12 @@ def generate_answers_for_sample(
     max_new_tokens: int,
 ) -> list[str]:
     """Run the local model on all turns of a sample."""
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": CANDIDATE_SYSTEM_PROMPT,
+        }
+    ]
     answers: list[str] = []
     for question in sample["turns"]:
         messages.append({"role": "user", "content": question})

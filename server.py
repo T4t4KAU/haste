@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import inspect
+import re
 import signal
 import threading
 import time
@@ -16,6 +18,9 @@ from urllib.parse import urlparse
 
 from haste import LLM, SamplingParams
 from haste.utils.profiling import build_profile_report
+
+THINK_BLOCK_RE = re.compile(r"<think>\s*.*?\s*</think>\s*", re.DOTALL)
+SPECIAL_CHAT_TOKEN_RE = re.compile(r"(?:<\|im_start\|>|<\|im_end\|>|<\|endoftext\|>)")
 
 
 class APIError(Exception):
@@ -126,11 +131,34 @@ def render_chat_prompt(messages: list[dict[str, Any]], tokenizer) -> str:
         normalized_messages.append({"role": role, "content": content})
 
     if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            normalized_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        apply_chat_template = tokenizer.apply_chat_template
+        kwargs: dict[str, Any] = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        try:
+            signature = inspect.signature(apply_chat_template)
+        except (TypeError, ValueError):
+            signature = None
+        supports_enable_thinking = signature is None
+        if signature is not None:
+            supports_enable_thinking = (
+                "enable_thinking" in signature.parameters
+                or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in signature.parameters.values()
+                )
+            )
+        if supports_enable_thinking:
+            try:
+                return apply_chat_template(
+                    normalized_messages,
+                    **kwargs,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                pass
+        return apply_chat_template(normalized_messages, **kwargs)
 
     prompt_lines = []
     for message in normalized_messages:
@@ -240,6 +268,25 @@ def build_sampling_params_list(
 def infer_finish_reason(output: dict[str, Any], sampling_params: SamplingParams) -> str:
     """Infer finish reason from output length."""
     return "length" if len(output["token_ids"]) >= sampling_params.max_new_tokens else "stop"
+
+
+def strip_thinking_output(text: str) -> str:
+    """Remove visible reasoning blocks from model text output.
+
+    Qwen3 chat templates can emit `<think>...</think>` blocks when reasoning mode
+    is enabled. The service disables that mode when possible, and this helper is
+    a final sanitization pass for safety and cross-version compatibility.
+    """
+    stripped = text.strip()
+    if stripped.startswith("<think>") and "</think>" not in stripped:
+        return ""
+    cleaned = THINK_BLOCK_RE.sub("", stripped).strip()
+    cleaned = SPECIAL_CHAT_TOKEN_RE.sub("", cleaned).strip()
+    if cleaned:
+        return cleaned
+    if stripped.startswith("<think>"):
+        return ""
+    return SPECIAL_CHAT_TOKEN_RE.sub("", stripped).strip()
 
 
 class HasteService:
@@ -356,7 +403,7 @@ class HasteService:
         formatted_outputs = [
             {
                 "index": idx,
-                "text": output["text"],
+                "text": strip_thinking_output(output["text"]),
                 "token_ids": output["token_ids"],
                 "finish_reason": infer_finish_reason(output, sampling_params[idx]),
             }
@@ -398,6 +445,7 @@ class HasteService:
 
         outputs, metrics = self.generate([prompt], [sampling_params], return_metrics=return_metrics)
         output = outputs[0]
+        cleaned_text = strip_thinking_output(output["text"])
         usage = self._usage_summary([prompt], outputs)
         finish_reason = infer_finish_reason(output, sampling_params)
         created = int(time.time())
@@ -413,7 +461,7 @@ class HasteService:
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": output["text"],
+                        "content": cleaned_text,
                     },
                     "finish_reason": finish_reason,
                 }

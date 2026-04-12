@@ -10,9 +10,10 @@ import server as haste_server
 
 
 class _TokenizerWithTemplate:
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=None):
         assert tokenize is False
         assert add_generation_prompt is True
+        assert enable_thinking is False
         return " | ".join(f"{message['role']}:{message['content']}" for message in messages) + " | assistant:"
 
 
@@ -87,6 +88,27 @@ class ServerHelpersTest(unittest.TestCase):
         )
 
         self.assertEqual(prompt, "USER: Hello\nASSISTANT:")
+
+    def test_strip_thinking_output_removes_think_block(self):
+        text = "<think>\ninternal reasoning\n</think>\n\nFinal answer."
+
+        cleaned = haste_server.strip_thinking_output(text)
+
+        self.assertEqual(cleaned, "Final answer.")
+
+    def test_strip_thinking_output_drops_dangling_think_only_output(self):
+        text = "<think>\ninternal reasoning without final answer"
+
+        cleaned = haste_server.strip_thinking_output(text)
+
+        self.assertEqual(cleaned, "")
+
+    def test_strip_thinking_output_removes_special_chat_tokens(self):
+        text = "2 + 2 = 4.<|im_end|>"
+
+        cleaned = haste_server.strip_thinking_output(text)
+
+        self.assertEqual(cleaned, "2 + 2 = 4.")
 
 
 if __name__ == "__main__":
