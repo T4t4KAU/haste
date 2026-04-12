@@ -13,6 +13,42 @@ from haste.layers.rotary_embedding import get_rope
 from haste.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
+def _extract_rope_scaling(config: Qwen3Config) -> dict | None:
+    """Normalize RoPE scaling settings across transformers versions.
+
+    Some environments expose Qwen3 long-context settings through
+    ``config.rope_scaling`` while newer transformers builds use
+    ``config.rope_parameters``. We normalize both to the dict format expected by
+    this project.
+    """
+    rope_scaling = getattr(config, "rope_scaling", None)
+    rope_parameters = getattr(config, "rope_parameters", None)
+
+    if isinstance(rope_parameters, dict):
+        if any(key in rope_parameters for key in ("rope_type", "type", "factor")):
+            rope_scaling = rope_parameters
+        else:
+            nested = next((value for value in rope_parameters.values() if isinstance(value, dict)), None)
+            if nested is not None:
+                rope_scaling = nested
+
+    if rope_scaling is None:
+        return None
+
+    normalized = dict(rope_scaling)
+    if "rope_type" not in normalized and "type" in normalized:
+        normalized["rope_type"] = normalized["type"]
+    if "rope_theta" not in normalized:
+        normalized["rope_theta"] = getattr(config, "rope_theta", 1000000)
+    if normalized.get("original_max_position_embeddings") is None:
+        normalized["original_max_position_embeddings"] = getattr(
+            config,
+            "original_max_position_embeddings",
+            getattr(config, "max_position_embeddings", None),
+        )
+    return normalized
+
+
 class Qwen3Attention(nn.Module):
     """Qwen3 attention module.
     
@@ -29,7 +65,8 @@ class Qwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
-        rope_scaling: tuple | None = None,
+        rope_scaling: dict | None = None,
+        rotary_emb: nn.Module | None = None,
         # speculation args 
         draft: bool = False,
         speculate: bool = False,
@@ -80,7 +117,7 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
-        self.rotary_emb = get_rope(
+        self.rotary_emb = rotary_emb or get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
@@ -188,6 +225,7 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        rotary_emb: nn.Module | None,
         draft: bool,
         speculate: bool,
         spec_k: int,
@@ -219,7 +257,8 @@ class Qwen3DecoderLayer(nn.Module):
             qkv_bias=getattr(config, 'attention_bias', False),
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_scaling=_extract_rope_scaling(config),
+            rotary_emb=rotary_emb,
             draft=self.draft,
             speculate=self.speculate,
             spec_k=self.spec_k,
@@ -293,6 +332,13 @@ class Qwen3Model(nn.Module):
         self.spec_k = spec_k
         self.async_fan_out = async_fan_out
         self.draft_async = draft_async
+        shared_rotary_emb = get_rope(
+            getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads,
+            rotary_dim=getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads,
+            max_position=config.max_position_embeddings,
+            base=getattr(config, "rope_theta", 1000000),
+            rope_scaling=_extract_rope_scaling(config),
+        )
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -301,6 +347,7 @@ class Qwen3Model(nn.Module):
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 config,
+                rotary_emb=shared_rotary_emb,
                 draft=self.draft,
                 speculate=self.speculate,
                 spec_k=self.spec_k,
