@@ -167,20 +167,33 @@ class ModelRunner:
             hf_config (AutoConfig): Hugging Face config
             
         Returns:
-            Qwen3ForCausalLM: Built model
+            nn.Module: Built model
         """
-        if hf_config.model_type != "qwen3":
+        if hf_config.model_type == "qwen3":
+            from haste.models.qwen3 import Qwen3ForCausalLM
+            model = Qwen3ForCausalLM(
+                config=hf_config,
+                draft=self.is_draft,
+                speculate=self.config.speculate,
+                spec_k=self.config.speculate_k,
+                async_fan_out=self.config.async_fan_out,
+                draft_async=self.config.draft_async,
+                auto_tune_kf=self.config.async_auto_tune,
+            )
+        elif hf_config.model_type in ["smollm2", "smol_lm2", "llama"]:
+            from haste.models.smollm2 import SmolLM2ForCausalLM
+            model = SmolLM2ForCausalLM(
+                config=hf_config,
+                draft=self.is_draft,
+                speculate=self.config.speculate,
+                spec_k=self.config.speculate_k,
+                async_fan_out=self.config.async_fan_out,
+                draft_async=self.config.draft_async,
+                auto_tune_kf=self.config.async_auto_tune,
+            )
+        else:
             raise ValueError(f"Unsupported model type: {hf_config.model_type}")
 
-        model = Qwen3ForCausalLM(
-            config=hf_config,
-            draft=self.is_draft,
-            speculate=self.config.speculate,
-            spec_k=self.config.speculate_k,
-            async_fan_out=self.config.async_fan_out,
-            draft_async=self.config.draft_async,
-            auto_tune_kf=self.config.async_auto_tune,
-        )
         return model.to(self.device)
 
     def shutdown(self):
