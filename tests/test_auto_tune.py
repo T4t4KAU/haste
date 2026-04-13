@@ -25,16 +25,24 @@ class AutoTunePolicyTest(unittest.TestCase):
             async_auto_tune_cache_hit_target=0.7,
             async_auto_tune_ema_alpha=0.35,
             async_auto_tune_score_tolerance=0.05,
+            verbose=False,
         )
         runner._controller_lock = Lock()
-        runner._worker_profile = {"cache_populate_times": [0.02]}
+        runner._worker_profile = {
+            "cache_populate_times": [0.02],
+            "request_wait_times": [],
+            "exposed_wait_times": [],
+        }
         runner._last_request_wait_ms = 0.0
+        runner._last_request_serve_ms = 10.0
+        runner._last_exposed_wait_ms = 0.0
         runner._last_cache_hit_rate = 0.2
         runner._last_accept_fraction = 0.0
         runner._fan_out_batch_hint = 0
         runner._runtime_lookahead_cap = 1
         runner._runtime_fan_out_cap = 1
         runner._auto_tune_state = None
+        runner._last_logged_policy = None
         return runner
 
     def test_auto_tune_search_starts_from_small_k_and_grows_when_hidden(self):
@@ -68,6 +76,38 @@ class AutoTunePolicyTest(unittest.TestCase):
 
         self.assertEqual(runner._runtime_lookahead_cap, 7)
         self.assertEqual(runner._runtime_fan_out_cap, 3)
+
+    def test_steady_state_grows_k_when_underfilled(self):
+        runner = self._make_runner(auto_tune=True)
+        runner._runtime_lookahead_cap = 2
+        runner._runtime_fan_out_cap = 1
+        runner._auto_tune_state = AutoTuneState(
+            stage="steady",
+            trial_k=2,
+            trial_f=1,
+            settled_k=2,
+            settled_f=1,
+            best_hidden_k=2,
+            best_hidden_f=1,
+            stable_steps=runner.config.async_auto_tune_reprobe_interval - 1,
+            ema_verify_ms=100.0,
+            ema_populate_ms=20.0,
+            ema_wait_ms=15.0,
+            ema_serve_ms=15.0,
+            ema_exposed_ms=0.0,
+            ema_cache_hit_rate=0.3,
+            ema_accept_fraction=0.6,
+            trial_observations=runner.config.async_auto_tune_probe_steps,
+        )
+        runner._worker_profile["cache_populate_times"].append(0.02)
+        runner._last_request_wait_ms = 15.0
+        runner._last_request_serve_ms = 15.0
+        runner._last_exposed_wait_ms = 0.0
+
+        runner.report_verify_feedback(verify_elapsed_s=0.10, batch_size=8, accepted_fraction=0.6)
+
+        self.assertEqual(runner._runtime_lookahead_cap, 3)
+        self.assertEqual(runner._runtime_fan_out_cap, 1)
 
 
 if __name__ == "__main__":

@@ -424,6 +424,7 @@ def print_profile_summary(report: dict[str, Any]) -> None:
                 f"final F={draft_worker.get('final_effective_f')}"
             )
         print_series_summary("Draft request wait", draft_worker.get("request_wait_ms", {}), "ms")
+        print_series_summary("Draft exposed wait", draft_worker.get("exposed_wait_ms", {}), "ms")
         print_series_summary("Draft worker serve", draft_worker.get("worker_serve_ms", {}), "ms")
         print_series_summary("Draft cache populate", draft_worker.get("cache_populate_ms", {}), "ms")
         print_series_summary("Effective lookahead", draft_worker.get("effective_lookahead", {}))

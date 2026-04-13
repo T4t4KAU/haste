@@ -197,6 +197,7 @@ def build_draft_worker_profile_summary(snapshot: dict[str, Any], *, device: str)
     return {
         "device": device,
         "request_wait_ms": summarize_numeric_series(snapshot["request_wait_times"], scale=1000.0),
+        "exposed_wait_ms": summarize_numeric_series(snapshot.get("exposed_wait_times", []), scale=1000.0),
         "worker_total_ms": summarize_numeric_series(snapshot["worker_total_times"], scale=1000.0),
         "worker_serve_ms": summarize_numeric_series(snapshot["worker_serve_times"], scale=1000.0),
         "cache_populate_ms": summarize_numeric_series(snapshot["cache_populate_times"], scale=1000.0),

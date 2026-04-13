@@ -32,6 +32,7 @@ class DraftResponse:
     from_q_mask: torch.Tensor  # Mask indicating which tokens are from query
     lookahead: int  # Lookahead value
     fan_out_cap: int  # Fan-out capacity
+    serve_ms: float = 0.0  # Worker serve time for this request in ms
 
 
 @dataclass
@@ -60,8 +61,13 @@ class AutoTuneState:
     ema_verify_ms: float = 0.0  # EMA of verification time in ms
     ema_populate_ms: float = 0.0  # EMA of populate time in ms
     ema_wait_ms: float = 0.0  # EMA of wait time in ms
+    ema_serve_ms: float = 0.0  # EMA of serve time in ms
+    ema_exposed_ms: float = 0.0  # EMA of exposed wait in ms
     ema_cache_hit_rate: float = 0.0  # EMA of cache hit rate
     ema_accept_fraction: float = 0.0  # EMA of accept fraction
+    probe_baseline_k: int = 1  # Baseline K before a steady-state reprobe
+    probe_baseline_f: int = 1  # Baseline F before a steady-state reprobe
+    probe_baseline_score: float = -1.0  # Baseline throughput score before reprobe
 
 
 class DraftRunner(ModelRunner):
@@ -105,6 +111,8 @@ class DraftRunner(ModelRunner):
         self._auto_tune_state: AutoTuneState | None = None  # Auto-tune state
         self._last_logged_policy: tuple[str, int, int] | None = None  # Last logged policy
         self._last_request_wait_ms = 0.0  # Last request wait time in ms
+        self._last_request_serve_ms = 0.0  # Last request serve time in ms
+        self._last_exposed_wait_ms = 0.0  # Last exposed wait time in ms
         self._last_cache_hit_rate = 0.0  # Last cache hit rate
         self._last_accept_fraction = 0.0  # Last accept fraction
         self._request_queue: queue.Queue | None = None  # Request queue
@@ -128,6 +136,7 @@ class DraftRunner(ModelRunner):
         self._reset_runtime_policy(log_init=False)
         self._worker_profile = {
             "request_wait_times": [],
+            "exposed_wait_times": [],
             "worker_total_times": [],
             "worker_serve_times": [],
             "cache_populate_times": [],
@@ -195,6 +204,8 @@ class DraftRunner(ModelRunner):
         self._fan_out_batch_hint = 0
         self._last_logged_policy = None
         self._last_request_wait_ms = 0.0
+        self._last_request_serve_ms = 0.0
+        self._last_exposed_wait_ms = 0.0
         self._last_cache_hit_rate = 0.0
         self._last_accept_fraction = 0.0
         if self.config.async_auto_tune:
@@ -269,6 +280,9 @@ class DraftRunner(ModelRunner):
         if isinstance(result, Exception):
             self._worker_error = result
             raise RuntimeError("draft worker failed") from result
+        self._last_request_serve_ms = max(0.0, float(getattr(result, "serve_ms", 0.0)))
+        self._last_exposed_wait_ms = max(0.0, self._last_request_wait_ms - self._last_request_serve_ms)
+        self._worker_profile["exposed_wait_times"].append(self._last_exposed_wait_ms / 1000.0)
         cache_hit_rate = result.cache_hits.to(torch.float32).mean().item()
         self._last_cache_hit_rate = cache_hit_rate
         self._worker_profile["cache_hit_rates"].append(cache_hit_rate)
@@ -395,6 +409,8 @@ class DraftRunner(ModelRunner):
         state.ema_verify_ms = 0.0
         state.ema_populate_ms = 0.0
         state.ema_wait_ms = 0.0
+        state.ema_serve_ms = 0.0
+        state.ema_exposed_ms = 0.0
         state.ema_cache_hit_rate = 0.0
         state.ema_accept_fraction = 0.0
 
@@ -436,13 +452,27 @@ class DraftRunner(ModelRunner):
         self._reset_auto_tune_observations(state)
         self._log_auto_tune_status("settled")
 
+    def _begin_runtime_reprobe(
+        self,
+        state: AutoTuneState,
+        stage: str,
+        trial_k: int,
+        trial_f: int,
+        baseline_score: float,
+    ) -> None:
+        """Probe a slightly more aggressive steady-state policy and revert if it loses."""
+        state.probe_baseline_k = self._runtime_lookahead_cap
+        state.probe_baseline_f = self._runtime_fan_out_cap
+        state.probe_baseline_score = baseline_score
+        self._begin_auto_tune_probe(state, stage, trial_k, trial_f)
+
     def _log_auto_tune_status(self, reason: str) -> None:
         """Log auto-tune status.
         
         Args:
             reason (str): Reason for logging
         """
-        if not self.config.async_auto_tune or not self.config.verbose:
+        if not self.config.async_auto_tune or not getattr(self.config, "verbose", False):
             return
         stage = self._auto_tune_state.stage if self._auto_tune_state is not None else "disabled"
         snapshot = (stage, self._runtime_lookahead_cap, self._runtime_fan_out_cap)
@@ -468,7 +498,8 @@ class DraftRunner(ModelRunner):
             bool: Whether auto-tune is hidden
         """
         verify_budget = max(1.0, state.ema_verify_ms * self.config.async_auto_tune_margin)
-        return state.ema_populate_ms <= verify_budget
+        exposed_budget = max(2.0, state.ema_verify_ms * self.config.async_auto_tune_wait_ratio)
+        return state.ema_populate_ms <= verify_budget and state.ema_exposed_ms <= exposed_budget
 
     def _auto_tune_underloaded(self, state: AutoTuneState) -> bool:
         """Check if auto-tune is underloaded.
@@ -480,8 +511,28 @@ class DraftRunner(ModelRunner):
             bool: Whether auto-tune is underloaded
         """
         verify_budget = max(1.0, state.ema_verify_ms * self.config.async_auto_tune_underfill_ratio)
-        wait_budget = max(20.0, state.ema_verify_ms * self.config.async_auto_tune_wait_ratio * 2.0)
-        return state.ema_populate_ms <= verify_budget and state.ema_wait_ms <= wait_budget
+        exposed_budget = max(1.0, state.ema_verify_ms * self.config.async_auto_tune_wait_ratio * 0.5)
+        return state.ema_populate_ms <= verify_budget and state.ema_exposed_ms <= exposed_budget
+
+    def _step_throughput_score(self, state: AutoTuneState) -> float:
+        """Estimate generation throughput for the current runtime policy."""
+        yielded_tokens = 1.0 + state.ema_accept_fraction * state.trial_k
+        step_ms = max(1.0, state.ema_verify_ms + state.ema_wait_ms)
+        return yielded_tokens / step_ms
+
+    def _next_k_probe(self, state: AutoTuneState, max_k: int) -> int:
+        """Choose the next K probe, ramping faster when overlap headroom is abundant."""
+        if state.trial_k >= max_k:
+            return max_k
+
+        deep_underloaded = (
+            state.trial_k >= 2
+            and state.ema_populate_ms <= max(1.0, state.ema_verify_ms * 0.4)
+            and state.ema_exposed_ms <= 1.0
+            and state.ema_accept_fraction >= self.config.async_auto_tune_accept_floor
+        )
+        step = 2 if deep_underloaded else 1
+        return min(max_k, state.trial_k + step)
 
     def _lookahead_score(self, state: AutoTuneState) -> float:
         """Calculate lookahead score.
@@ -492,8 +543,7 @@ class DraftRunner(ModelRunner):
         Returns:
             float: Lookahead score
         """
-        accepted_tokens = state.ema_accept_fraction * state.trial_k
-        return accepted_tokens / max(1.0, state.ema_verify_ms)
+        return self._step_throughput_score(state)
 
     def _fan_out_score(self, state: AutoTuneState) -> float:
         """Calculate fan-out score.
@@ -504,8 +554,7 @@ class DraftRunner(ModelRunner):
         Returns:
             float: Fan-out score
         """
-        accepted_tokens = state.ema_accept_fraction * state.trial_k
-        return accepted_tokens / max(1.0, state.ema_verify_ms)
+        return self._step_throughput_score(state)
 
     def report_verify_feedback(
         self,
@@ -528,13 +577,11 @@ class DraftRunner(ModelRunner):
         if verify_ms <= 0:
             return
 
-        recent_populates = self._worker_profile["cache_populate_times"][-3:]
-        populate_ms = (
-            1000.0 * sum(recent_populates) / len(recent_populates)
-            if recent_populates
-            else 0.0
-        )
+        recent_populates = self._worker_profile["cache_populate_times"]
+        populate_ms = 1000.0 * recent_populates[-1] if recent_populates else 0.0
         wait_ms = self._last_request_wait_ms
+        serve_ms = self._last_request_serve_ms
+        exposed_ms = self._last_exposed_wait_ms
         cache_hit_rate = self._last_cache_hit_rate
         state = self._auto_tune_state
         if state is None:
@@ -548,12 +595,18 @@ class DraftRunner(ModelRunner):
             state.ema_verify_ms = self._ema(state.ema_verify_ms, verify_ms, alpha, initialized)
             state.ema_populate_ms = self._ema(state.ema_populate_ms, populate_ms, alpha, initialized)
             state.ema_wait_ms = self._ema(state.ema_wait_ms, wait_ms, alpha, initialized)
+            state.ema_serve_ms = self._ema(state.ema_serve_ms, serve_ms, alpha, initialized)
+            state.ema_exposed_ms = self._ema(state.ema_exposed_ms, exposed_ms, alpha, initialized)
             state.ema_cache_hit_rate = self._ema(state.ema_cache_hit_rate, cache_hit_rate, alpha, initialized)
             state.ema_accept_fraction = self._ema(state.ema_accept_fraction, accepted_fraction, alpha, initialized)
             state.trial_observations += 1
 
             hidden = self._auto_tune_hidden(state)
             probe_ready = state.trial_observations >= self.config.async_auto_tune_probe_steps
+            accept_ready = (
+                state.trial_k <= min_k
+                or state.ema_accept_fraction >= self.config.async_auto_tune_accept_floor
+            )
 
             if state.stage == "search_k":
                 if not probe_ready:
@@ -562,13 +615,13 @@ class DraftRunner(ModelRunner):
                 k_score = self._lookahead_score(state)
                 score_floor = state.best_k_score * (1.0 - self.config.async_auto_tune_score_tolerance)
 
-                if hidden and (state.best_k_score < 0.0 or k_score >= score_floor):
+                if hidden and accept_ready and (state.best_k_score < 0.0 or k_score >= score_floor):
                     if k_score > state.best_k_score:
                         state.best_k_score = k_score
                         state.best_hidden_k = state.trial_k
                     state.settled_k = state.trial_k
                     if state.trial_k < max_k:
-                        self._begin_auto_tune_probe(state, "search_k", state.trial_k + 1, min_f)
+                        self._begin_auto_tune_probe(state, "search_k", self._next_k_probe(state, max_k), min_f)
                         return
 
                 settled_k = max(min_k, state.best_hidden_k)
@@ -600,7 +653,19 @@ class DraftRunner(ModelRunner):
                 self._settle_auto_tune(state, state.settled_k, settled_f)
                 return
 
-            exposed_wait = state.ema_wait_ms > max(20.0, state.ema_verify_ms * self.config.async_auto_tune_wait_ratio * 3.0)
+            if state.stage in {"reprobe_k", "reprobe_f"}:
+                if not probe_ready:
+                    return
+
+                probe_score = self._step_throughput_score(state)
+                baseline_floor = state.probe_baseline_score * (1.0 - self.config.async_auto_tune_score_tolerance)
+                if hidden and (state.probe_baseline_score < 0.0 or probe_score >= baseline_floor):
+                    self._settle_auto_tune(state, state.trial_k, state.trial_f)
+                else:
+                    self._settle_auto_tune(state, state.probe_baseline_k, state.probe_baseline_f)
+                return
+
+            exposed_wait = state.ema_exposed_ms > max(2.0, state.ema_verify_ms * self.config.async_auto_tune_wait_ratio)
             overloaded = (not hidden) or exposed_wait
             underloaded = self._auto_tune_underloaded(state)
 
@@ -608,7 +673,11 @@ class DraftRunner(ModelRunner):
                 state.stable_steps = 0
                 old_k = self._runtime_lookahead_cap
                 old_f = self._runtime_fan_out_cap
-                if self._runtime_fan_out_cap > min_f and (state.ema_cache_hit_rate > 0.25 or state.ema_populate_ms > state.ema_verify_ms):
+                if self._runtime_fan_out_cap > min_f and (
+                    state.ema_exposed_ms > 0.0
+                    or state.ema_cache_hit_rate > self.config.async_auto_tune_cache_hit_target
+                    or state.ema_populate_ms > state.ema_verify_ms
+                ):
                     self._runtime_fan_out_cap -= 1
                 elif self._runtime_lookahead_cap > min_k:
                     self._runtime_lookahead_cap -= 1
@@ -616,12 +685,41 @@ class DraftRunner(ModelRunner):
                     self._runtime_fan_out_cap -= 1
                 state.settled_k = self._runtime_lookahead_cap
                 state.settled_f = self._runtime_fan_out_cap
+                state.trial_k = self._runtime_lookahead_cap
+                state.trial_f = self._runtime_fan_out_cap
                 state.best_hidden_k = self._runtime_lookahead_cap
                 state.best_hidden_f = self._runtime_fan_out_cap
+                self._reset_auto_tune_observations(state)
                 if self._runtime_lookahead_cap != old_k or self._runtime_fan_out_cap != old_f:
                     self._log_auto_tune_status("shrink")
             else:
                 state.stable_steps += 1
+                if underloaded and state.stable_steps >= self.config.async_auto_tune_reprobe_interval:
+                    baseline_score = self._step_throughput_score(state)
+                    if (
+                        self._runtime_lookahead_cap < max_k
+                        and state.ema_accept_fraction >= self.config.async_auto_tune_accept_floor
+                    ):
+                        self._begin_runtime_reprobe(
+                            state,
+                            "reprobe_k",
+                            self._runtime_lookahead_cap + 1,
+                            self._runtime_fan_out_cap,
+                            baseline_score,
+                        )
+                        return
+                    elif (
+                        self._runtime_fan_out_cap < max_f
+                        and state.ema_cache_hit_rate < self.config.async_auto_tune_cache_hit_target
+                    ):
+                        self._begin_runtime_reprobe(
+                            state,
+                            "reprobe_f",
+                            self._runtime_lookahead_cap,
+                            self._runtime_fan_out_cap + 1,
+                            baseline_score,
+                        )
+                        return
 
     @torch.inference_mode()
     def _trace_speculation_paths(
@@ -1045,6 +1143,7 @@ class DraftRunner(ModelRunner):
                     request.seqs
                 )
                 serve_elapsed = time.perf_counter() - serve_start
+                response.serve_ms = serve_elapsed * 1000.0
                 request.response_q.put(response)
                 populate_start = time.perf_counter()
                 populate_branch_count, used_fast_populate = self._populate_next_cache(
