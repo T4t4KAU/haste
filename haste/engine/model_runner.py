@@ -180,9 +180,20 @@ class ModelRunner:
                 draft_async=self.config.draft_async,
                 auto_tune_kf=self.config.async_auto_tune,
             )
-        elif hf_config.model_type in ["smollm2", "smol_lm2", "llama"]:
+        elif hf_config.model_type in ["smollm2", "smol_lm2"]:
             from haste.models.smollm2 import SmolLM2ForCausalLM
             model = SmolLM2ForCausalLM(
+                config=hf_config,
+                draft=self.is_draft,
+                speculate=self.config.speculate,
+                spec_k=self.config.speculate_k,
+                async_fan_out=self.config.async_fan_out,
+                draft_async=self.config.draft_async,
+                auto_tune_kf=self.config.async_auto_tune,
+            )
+        elif hf_config.model_type == "llama":
+            from haste.models.llama3_2 import Llama3_2ForCausalLM
+            model = Llama3_2ForCausalLM(
                 config=hf_config,
                 draft=self.is_draft,
                 speculate=self.config.speculate,
