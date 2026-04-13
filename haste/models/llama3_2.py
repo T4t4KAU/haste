@@ -425,7 +425,7 @@ class Llama3_2ForCausalLM(nn.Module):
             print(
                 "Starting Llama3_2ForCausalLM init, "
                 f"draft={draft}, speculate={speculate}, "
-                f"spec_k_max={spec_k}, async_fan_out_max={async_fan_out}, auto_tune_kf=True"
+                f"spec_k={spec_k}, async_fan_out={async_fan_out}, auto_tune_kf=True"
             )
         else:
             print(
@@ -446,7 +446,7 @@ class Llama3_2ForCausalLM(nn.Module):
             print(
                 "Finishing Llama3_2ForCausalLM init, "
                 f"draft={draft}, speculate={speculate}, "
-                f"spec_k_max={spec_k}, async_fan_out_max={async_fan_out}, auto_tune_kf=True"
+                f"spec_k={spec_k}, async_fan_out={async_fan_out}, auto_tune_kf=True"
             )
         else:
             print(

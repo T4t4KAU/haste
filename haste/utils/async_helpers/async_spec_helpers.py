@@ -84,7 +84,6 @@ def get_forked_recovery_tokens_from_logits(
     
     # Use scatter_ to set returned tokens to -inf so we don't include those in forked tokens 
     # Don't touch the last sequence position, only scatter the first K positions
-    logits = logits.clone()
     logits[:, :-1, :] = logits[:, :-1, :].scatter(
         dim=2,
         index=returned_tokens[:, 1:].unsqueeze(2),

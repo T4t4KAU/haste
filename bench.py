@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Any
 
 import torch
+from tqdm.auto import tqdm
 
 from haste import LLM, SamplingParams
 from haste.utils.profiling import build_profile_report, save_profile_report
@@ -481,14 +482,27 @@ def main():
 
         prompt_min, prompt_max, prompt_avg = summarize_prompt_lengths(llm.tokenizer, prompts)
 
+        progress = None
+        stream_callback = None
+        if args.use_tqdm:
+            total_tokens = sum(sp.max_new_tokens for sp in sampling_params)
+            progress = tqdm(total=total_tokens, desc="Generating", dynamic_ncols=True)
+
+            def _progress_callback(_seq_id, token_ids):
+                progress.update(len(token_ids))
+
+            stream_callback = _progress_callback
+
         start = perf_counter()
         outputs, metrics = llm.generate(
             prompts,
             sampling_params,
-            use_tqdm=args.use_tqdm,
-            stream_callback=lambda *_: None,
+            use_tqdm=False,
+            stream_callback=stream_callback,
         )
         elapsed = perf_counter() - start
+        if progress is not None:
+            progress.close()
     finally:
         llm.shutdown()
 

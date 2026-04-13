@@ -1,6 +1,7 @@
 """Draft runner for speculative decoding."""
 
 import dataclasses
+import os
 import queue
 import time
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ class CachedDraftState:
     fork_recovery_tokens: torch.Tensor  # Fork recovery tokens
     lookahead: int  # Lookahead value
     fork_width: int  # Fork width
+    gpu_speculation: torch.Tensor | None = None  # Optional GPU speculation cache
 
 
 @dataclass
@@ -149,6 +151,44 @@ class DraftRunner(ModelRunner):
             "effective_lookaheads": [],
             "effective_fan_out_caps": [],
         }
+
+    def _maybe_pin_cpu(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Pin CPU tensors when CUDA is available to speed host/device transfers."""
+        if self.device.type != "cuda" or tensor.device.type != "cpu":
+            return tensor
+        if tensor.is_pinned():
+            return tensor
+        return tensor.pin_memory()
+
+    def _gpu_cache_budget_bytes(self) -> int:
+        """Get GPU cache budget in bytes for async draft caching."""
+        if self.device.type != "cuda":
+            return 0
+        env_mb = os.environ.get("HASTE_ASYNC_GPU_CACHE_MB")
+        if env_mb:
+            try:
+                return max(0, int(env_mb)) * 1024 * 1024
+            except ValueError:
+                return 0
+        return 256 * 1024 * 1024
+
+    def _should_keep_gpu_cache(self, tensor: torch.Tensor) -> bool:
+        """Heuristic to keep a GPU copy of speculation cache."""
+        budget = self._gpu_cache_budget_bytes()
+        if budget <= 0:
+            return False
+        bytes_needed = tensor.numel() * tensor.element_size()
+        return bytes_needed <= budget
+
+    def _to_cpu_pinned(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
+        """Move CUDA tensors to pinned CPU memory for non-blocking transfers."""
+        if tensor is None:
+            return None
+        if tensor.device.type == "cpu":
+            return self._maybe_pin_cpu(tensor)
+        cpu_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
+        cpu_tensor.copy_(tensor, non_blocking=False)
+        return cpu_tensor
 
     def worker_profile_summary(self) -> dict:
         """Get worker profile summary.
@@ -891,7 +931,10 @@ class DraftRunner(ModelRunner):
                 continue
 
             cache_hits[idx] = True
-            speculations[idx] = cached_state.speculation[: lookahead + 1].to(self.device, non_blocking=False)
+            if cached_state.gpu_speculation is not None:
+                speculations[idx] = cached_state.gpu_speculation[: lookahead + 1]
+            else:
+                speculations[idx] = cached_state.speculation[: lookahead + 1].to(self.device, non_blocking=True)
 
             expected_width = sum(fan_out_list)
             if self._needs_hit_logits(seqs[idx]) or cached_state.fork_width < expected_width:
@@ -938,7 +981,7 @@ class DraftRunner(ModelRunner):
                 miss_all_logits = None
                 assert miss_fork_tokens is not None
                 for local_idx, batch_idx in enumerate(miss_indices):
-                    hit_fork_overrides[batch_idx] = miss_fork_tokens[local_idx].cpu()
+                    hit_fork_overrides[batch_idx] = self._to_cpu_pinned(miss_fork_tokens[local_idx])
 
             miss_index_t = torch.tensor(miss_indices, dtype=torch.long, device=self.device)
             speculations[miss_index_t] = miss_specs
@@ -963,9 +1006,9 @@ class DraftRunner(ModelRunner):
             computed_logits.append(hit_all_logits)
 
         response = DraftResponse(
-            speculations=speculations.cpu(),
-            logits_q=logits_q.cpu() if logits_q is not None else None,
-            cache_hits=cache_hits.cpu(),
+            speculations=self._to_cpu_pinned(speculations),
+            logits_q=self._to_cpu_pinned(logits_q),
+            cache_hits=self._to_cpu_pinned(cache_hits),
             from_q_mask=torch.ones(batch_size, dtype=torch.bool),
             lookahead=lookahead,
             fan_out_cap=max(max(fan_out_list, default=0), max(fan_out_list_miss, default=0)),
@@ -1043,7 +1086,7 @@ class DraftRunner(ModelRunner):
                     recovery_token = candidate_tokens[offset]
                     offset += 1
                     branch_keys.append((seq.seq_id, accepted_count, recovery_token))
-                    branch_token_batches.append(base_tokens.copy())
+                    branch_token_batches.append(base_tokens)
                     branch_recovery_tokens.append(recovery_token)
                     branch_temperatures.append(temperature)
 
@@ -1067,7 +1110,7 @@ class DraftRunner(ModelRunner):
                 min(lookahead, max(1, self.config.async_fast_populate_steps)),
                 fan_out_list,
             )
-            branch_fork_recovery_tokens = branch_fork_recovery_tokens.cpu()
+            branch_fork_recovery_tokens = self._maybe_pin_cpu(branch_fork_recovery_tokens.cpu())
         elif all(temperature == 0 for temperature in branch_temperatures):
             branch_specs, _, _, branch_fork_recovery_tokens = self.speculate_stateless_batch(
                 branch_token_batches,
@@ -1079,7 +1122,7 @@ class DraftRunner(ModelRunner):
                 fork_counts=fan_out_list,
             )
             assert branch_fork_recovery_tokens is not None
-            branch_fork_recovery_tokens = branch_fork_recovery_tokens.cpu()
+            branch_fork_recovery_tokens = self._maybe_pin_cpu(branch_fork_recovery_tokens.cpu())
         else:
             branch_specs, _, branch_all_logits, _ = self.speculate_stateless_batch(
                 branch_token_batches,
@@ -1099,15 +1142,18 @@ class DraftRunner(ModelRunner):
                 fan_out_list=fan_out_list,
                 fan_out_list_miss=fan_out_list_miss,
                 lookahead=lookahead,
-            ).cpu()
+            )
+            branch_fork_recovery_tokens = self._maybe_pin_cpu(branch_fork_recovery_tokens.cpu())
 
-        branch_specs_cpu = branch_specs.cpu()
+        branch_specs_cpu = self._maybe_pin_cpu(branch_specs.cpu())
+        gpu_cache = branch_specs if self._should_keep_gpu_cache(branch_specs) else None
         self._tree_cache = {
             key: CachedDraftState(
                 speculation=branch_specs_cpu[idx].clone(),
-                fork_recovery_tokens=branch_fork_recovery_tokens[idx].clone(),
+                fork_recovery_tokens=self._maybe_pin_cpu(branch_fork_recovery_tokens[idx].clone()),
                 lookahead=lookahead,
                 fork_width=int(branch_fork_recovery_tokens[idx].numel()),
+                gpu_speculation=gpu_cache[idx].clone() if gpu_cache is not None else None,
             )
             for idx, key in enumerate(branch_keys)
         }
