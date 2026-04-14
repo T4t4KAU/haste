@@ -117,8 +117,8 @@ The `bench.py` script benchmarks Haste on real prompts and now emits both throug
 - `--max-new-tokens`: Maximum number of new tokens to generate (default: 128)
 - `--temperature`: Sampling temperature for target model (default: 0.0)
 - `--draft-temperature`: Sampling temperature for draft model (default: 0.0)
-- `--speculate-k`: Number of tokens to speculate (default: 7)
-- `--async-fan-out`: Number of async draft runners (default: 3)
+- `--speculate-k`: Number of tokens to speculate (default: 1)
+- `--async-fan-out`: Number of async draft runners (default: 1)
 - `--auto-tune-kf`: Dynamically search and adjust speculative lookahead/fan-out at runtime
 - `--verbose`: Enable detailed runtime logs, including auto-tune K/F transitions
 - `--max-model-len`: Maximum model length (default: 4096)
@@ -164,8 +164,8 @@ The `server.py` script starts a lightweight HTTP service around a single loaded 
 - `--max-num-batched-tokens`: Maximum number of batched tokens for the scheduler (default: `4096`)
 - `--max-model-len`: Maximum model length (default: `4096`)
 - `--default-max-new-tokens`: Default generation length when the request does not override it (default: `128`)
-- `--speculate-k`: Number of tokens to speculate (default: `7`)
-- `--async-fan-out`: Number of async draft runners (default: `3`)
+- `--speculate-k`: Number of tokens to speculate (default: `1`)
+- `--async-fan-out`: Number of async draft runners (default: `1`)
 - `--auto-tune-kf`: Dynamically search and adjust speculative lookahead/fan-out at runtime
 - `--enforce-eager`: Disable CUDA graph capture and force eager mode
 - `--verbose`: Enable verbose runtime logs

@@ -56,8 +56,12 @@ class AutoTuneState:
     settled_f: int  # Settled fan-out value
     best_hidden_k: int  # Best hidden lookahead value
     best_hidden_f: int  # Best hidden fan-out value
-    best_k_score: float = -1.0  # Best lookahead score
-    best_f_score: float = -1.0  # Best fan-out score
+    best_k_score: float = -1.0  # Best lookahead score (overall)
+    best_f_score: float = -1.0  # Best fan-out score (overall)
+    best_any_k: int = 1  # Best lookahead value (overall)
+    best_any_f: int = 1  # Best fan-out value (overall)
+    best_hidden_k_score: float = -1.0  # Best hidden lookahead score
+    best_hidden_f_score: float = -1.0  # Best hidden fan-out score
     trial_observations: int = 0  # Number of trial observations
     stable_steps: int = 0  # Number of stable steps
     ema_verify_ms: float = 0.0  # EMA of verification time in ms
@@ -261,6 +265,8 @@ class DraftRunner(ModelRunner):
                 settled_f=min_f,
                 best_hidden_k=min_k,
                 best_hidden_f=min_f,
+                best_any_k=min_k,
+                best_any_f=min_f,
             )
             if log_init:
                 self._log_auto_tune_status("init")
@@ -486,6 +492,12 @@ class DraftRunner(ModelRunner):
         state.settled_f = settled_f
         state.best_hidden_k = settled_k
         state.best_hidden_f = settled_f
+        state.best_any_k = settled_k
+        state.best_any_f = settled_f
+        state.best_k_score = -1.0
+        state.best_f_score = -1.0
+        state.best_hidden_k_score = -1.0
+        state.best_hidden_f_score = -1.0
         state.stable_steps = 0
         self._runtime_lookahead_cap = settled_k
         self._runtime_fan_out_cap = settled_f
@@ -553,6 +565,29 @@ class DraftRunner(ModelRunner):
         verify_budget = max(1.0, state.ema_verify_ms * self.config.async_auto_tune_underfill_ratio)
         exposed_budget = max(1.0, state.ema_verify_ms * self.config.async_auto_tune_wait_ratio * 0.5)
         return state.ema_populate_ms <= verify_budget and state.ema_exposed_ms <= exposed_budget
+
+    @staticmethod
+    def _overlap_ratios(state: AutoTuneState) -> tuple[float, float]:
+        """Return populate/verify and exposed/verify ratios for overlap checks."""
+        verify_ms = max(1.0, state.ema_verify_ms)
+        return state.ema_populate_ms / verify_ms, state.ema_exposed_ms / verify_ms
+
+    def _can_explore_k(self, state: AutoTuneState) -> bool:
+        """Allow K exploration when populate is not far beyond verify."""
+        populate_ratio, _ = self._overlap_ratios(state)
+        return populate_ratio <= (self.config.async_auto_tune_margin + 0.15)
+
+    def _can_explore_f(self, state: AutoTuneState) -> bool:
+        """Allow F exploration when cache misses dominate and draft is not too slow."""
+        populate_ratio, exposed_ratio = self._overlap_ratios(state)
+        if populate_ratio > (self.config.async_auto_tune_margin + 0.20):
+            return False
+        if (
+            state.ema_cache_hit_rate >= self.config.async_auto_tune_cache_hit_target
+            and exposed_ratio <= self.config.async_auto_tune_wait_ratio
+        ):
+            return False
+        return True
 
     def _step_throughput_score(self, state: AutoTuneState) -> float:
         """Estimate generation throughput for the current runtime policy."""
@@ -643,31 +678,35 @@ class DraftRunner(ModelRunner):
 
             hidden = self._auto_tune_hidden(state)
             probe_ready = state.trial_observations >= self.config.async_auto_tune_probe_steps
-            accept_ready = (
-                state.trial_k <= min_k
-                or state.ema_accept_fraction >= self.config.async_auto_tune_accept_floor
-            )
 
             if state.stage == "search_k":
                 if not probe_ready:
                     return
 
                 k_score = self._lookahead_score(state)
+                if state.best_k_score < 0.0 or k_score > state.best_k_score:
+                    state.best_k_score = k_score
+                    state.best_any_k = state.trial_k
+                if hidden and (state.best_hidden_k_score < 0.0 or k_score > state.best_hidden_k_score):
+                    state.best_hidden_k_score = k_score
+                    state.best_hidden_k = state.trial_k
+
                 score_floor = state.best_k_score * (1.0 - self.config.async_auto_tune_score_tolerance)
+                explore_ok = hidden or self._can_explore_k(state)
+                if (
+                    explore_ok
+                    and state.trial_k < max_k
+                    and (state.best_k_score < 0.0 or k_score >= score_floor)
+                ):
+                    self._begin_auto_tune_probe(state, "search_k", self._next_k_probe(state, max_k), min_f)
+                    return
 
-                if hidden and accept_ready and (state.best_k_score < 0.0 or k_score >= score_floor):
-                    if k_score > state.best_k_score:
-                        state.best_k_score = k_score
-                        state.best_hidden_k = state.trial_k
-                    state.settled_k = state.trial_k
-                    if state.trial_k < max_k:
-                        self._begin_auto_tune_probe(state, "search_k", self._next_k_probe(state, max_k), min_f)
-                        return
-
-                settled_k = max(min_k, state.best_hidden_k)
+                settled_k = state.best_hidden_k if state.best_hidden_k_score >= 0.0 else state.best_any_k
                 state.settled_k = settled_k
                 state.best_hidden_f = min_f
+                state.best_any_f = min_f
                 state.best_f_score = -1.0
+                state.best_hidden_f_score = -1.0
                 if max_f > min_f:
                     self._begin_auto_tune_probe(state, "search_f", settled_k, min_f)
                 else:
@@ -679,17 +718,24 @@ class DraftRunner(ModelRunner):
                     return
 
                 f_score = self._fan_out_score(state)
+                if state.best_f_score < 0.0 or f_score > state.best_f_score:
+                    state.best_f_score = f_score
+                    state.best_any_f = state.trial_f
+                if hidden and (state.best_hidden_f_score < 0.0 or f_score > state.best_hidden_f_score):
+                    state.best_hidden_f_score = f_score
+                    state.best_hidden_f = state.trial_f
+
                 score_floor = state.best_f_score * (1.0 - self.config.async_auto_tune_score_tolerance)
+                explore_ok = hidden or self._can_explore_f(state)
+                if (
+                    explore_ok
+                    and state.trial_f < max_f
+                    and (state.best_f_score < 0.0 or f_score >= score_floor)
+                ):
+                    self._begin_auto_tune_probe(state, "search_f", state.settled_k, state.trial_f + 1)
+                    return
 
-                if hidden and (state.best_f_score < 0.0 or f_score >= score_floor):
-                    if f_score > state.best_f_score:
-                        state.best_f_score = f_score
-                        state.best_hidden_f = state.trial_f
-                    if state.trial_f < max_f:
-                        self._begin_auto_tune_probe(state, "search_f", state.settled_k, state.trial_f + 1)
-                        return
-
-                settled_f = max(min_f, state.best_hidden_f)
+                settled_f = state.best_hidden_f if state.best_hidden_f_score >= 0.0 else state.best_any_f
                 self._settle_auto_tune(state, state.settled_k, settled_f)
                 return
 
