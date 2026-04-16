@@ -6,6 +6,7 @@ This folder contains baseline autoregressive benchmarks for fair comparison with
 
 1. **CPU AR**: pure CPU autoregressive inference (no draft model).
 2. **CPU+GPU Offload AR**: device-map offload inference (no draft model).
+3. **Dovetail**: heterogeneous speculative decoding baseline vendored under `baselines/dovetail`.
 
 ## Run Baselines
 
@@ -49,6 +50,24 @@ python -O baselines/bench_baselines.py \
   --max-num-seqs 8 \
   --max-new-tokens 128 \
   --offload-gpu-mem-frac 0.6 \
+  --use-tqdm
+```
+
+## Dovetail Baseline
+
+Run the dovetail baseline through `bench_baselines.py`:
+
+```bash
+python -O baselines/bench_baselines.py \
+  --mode dovetail \
+  --model-path /path/to/Qwen3-4B \
+  --draft-model-path /path/to/Qwen3-0.6B \
+  --dataset-root ./datasets \
+  --datasets alpaca,gsm8k \
+  --prompt-limit 160 \
+  --max-new-tokens 128 \
+  --num-draft-tokens 7 \
+  --draft-device auto \
   --use-tqdm
 ```
 

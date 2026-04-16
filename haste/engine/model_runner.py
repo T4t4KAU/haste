@@ -118,6 +118,61 @@ class ModelRunner:
                 "input_tokens",
             )
         }
+        self._profile["transfer_h2d_times"] = []
+        self._profile["transfer_d2h_times"] = []
+        self._profile["transfer_h2d_bytes"] = []
+        self._profile["transfer_d2h_bytes"] = []
+        self._pending_cuda_transfer_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event, int]] = []
+
+    def _queue_transfer_event(
+        self,
+        direction: str,
+        start_event: torch.cuda.Event,
+        end_event: torch.cuda.Event,
+        num_bytes: int,
+    ) -> None:
+        """Queue a CUDA transfer event for deferred aggregation."""
+        if self.device.type != "cuda":
+            return
+        self._pending_cuda_transfer_events.append((direction, start_event, end_event, int(num_bytes)))
+
+    def _flush_transfer_events(self) -> None:
+        """Flush queued CUDA transfer events into scalar profile series."""
+        if self.device.type != "cuda" or not self._pending_cuda_transfer_events:
+            return
+        torch.cuda.synchronize(self.device)
+        pending = self._pending_cuda_transfer_events
+        self._pending_cuda_transfer_events = []
+        for direction, start_event, end_event, num_bytes in pending:
+            elapsed_sec = max(0.0, start_event.elapsed_time(end_event) / 1000.0)
+            self._profile[f"transfer_{direction}_times"].append(elapsed_sec)
+            self._profile[f"transfer_{direction}_bytes"].append(num_bytes)
+
+    def _move_tensor_to_device(self, tensor: torch.Tensor, *, non_blocking: bool = False) -> torch.Tensor:
+        """Move a tensor to the runner device and record CPU->GPU transfer time."""
+        if tensor.device == self.device:
+            return tensor
+        if self.device.type == "cuda" and tensor.device.type == "cpu":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            moved = tensor.to(self.device, non_blocking=non_blocking)
+            end_event.record()
+            self._queue_transfer_event("h2d", start_event, end_event, tensor.numel() * tensor.element_size())
+            return moved
+        return tensor.to(self.device, non_blocking=non_blocking)
+
+    def _tensor_to_list(self, tensor: torch.Tensor) -> list:
+        """Convert a tensor to a Python list and record GPU->CPU transfer time."""
+        if tensor.device.type != "cuda":
+            return tensor.tolist()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        values = tensor.tolist()
+        end_event.record()
+        self._queue_transfer_event("d2h", start_event, end_event, tensor.numel() * tensor.element_size())
+        return values
 
     def _record_profile(
         self,
@@ -154,6 +209,7 @@ class ModelRunner:
         Returns:
             dict: Profile summary
         """
+        self._flush_transfer_events()
         return build_runner_profile_summary(
             self._profile,
             device=str(self.device),
@@ -333,12 +389,23 @@ class ModelRunner:
     def prepare_prefill(self, seqs: list[Sequence]):
         """Prepare tensors for prefill."""
         input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping = (
-            prepare_prefill_tensors_from_seqs(seqs, self.block_size, self.is_draft, device=self.device)
+            prepare_prefill_tensors_from_seqs(
+                seqs,
+                self.block_size,
+                self.is_draft,
+                device=self.device,
+                transfer_recorder=self._queue_transfer_event,
+            )
         )
 
         block_tables = None
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
-            block_tables = prepare_block_tables_from_seqs(seqs, self.is_draft, device=self.device)
+            block_tables = prepare_block_tables_from_seqs(
+                seqs,
+                self.is_draft,
+                device=self.device,
+                transfer_recorder=self._queue_transfer_event,
+            )
 
         set_context(
             is_prefill=True,
@@ -367,8 +434,14 @@ class ModelRunner:
             verify,
             lookahead if verify else -1,
             device=self.device,
+            transfer_recorder=self._queue_transfer_event,
         )
-        block_tables = prepare_block_tables_from_seqs(seqs, self.is_draft, device=self.device)
+        block_tables = prepare_block_tables_from_seqs(
+            seqs,
+            self.is_draft,
+            device=self.device,
+            transfer_recorder=self._queue_transfer_event,
+        )
 
         if verify:
             seqlen_q = torch.full(
@@ -406,11 +479,14 @@ class ModelRunner:
                 temperatures.append(seq.temperature)
 
         pin_memory = self.device.type == "cuda"
-        return torch.tensor(
-            temperatures,
-            dtype=torch.float32,
-            pin_memory=pin_memory,
-        ).to(self.device, non_blocking=pin_memory)
+        return self._move_tensor_to_device(
+            torch.tensor(
+                temperatures,
+                dtype=torch.float32,
+                pin_memory=pin_memory,
+            ),
+            non_blocking=pin_memory,
+        )
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool, last_only: bool = True):
@@ -467,7 +543,7 @@ class ModelRunner:
                 result = logits
             else:
                 sample_start = perf_counter()
-                token_ids = self.sampler(logits, temperatures).tolist()
+                token_ids = self._tensor_to_list(self.sampler(logits, temperatures))
                 sample_time = perf_counter() - sample_start
                 result = (token_ids, logits) if draft_return_logits else token_ids
         finally:
@@ -500,9 +576,18 @@ class ModelRunner:
             max_len = max(max_len, len(tokens))
 
         pin_memory = self.device.type == "cuda"
-        input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin_memory).to(self.device, non_blocking=pin_memory)
-        positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=pin_memory).to(self.device, non_blocking=pin_memory)
-        cu_seqlens_t = torch.tensor(cu_seqlens, dtype=torch.int32, pin_memory=pin_memory).to(self.device, non_blocking=pin_memory)
+        input_ids_t = self._move_tensor_to_device(
+            torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin_memory),
+            non_blocking=pin_memory,
+        )
+        positions_t = self._move_tensor_to_device(
+            torch.tensor(positions, dtype=torch.int64, pin_memory=pin_memory),
+            non_blocking=pin_memory,
+        )
+        cu_seqlens_t = self._move_tensor_to_device(
+            torch.tensor(cu_seqlens, dtype=torch.int32, pin_memory=pin_memory),
+            non_blocking=pin_memory,
+        )
 
         set_context(
             is_prefill=True,
@@ -593,7 +678,7 @@ class ModelRunner:
 
             if step_logits is not None:
                 step_logits.append(logits)
-            next_tokens = self.sampler(logits, temp_t).tolist()
+            next_tokens = self._tensor_to_list(self.sampler(logits, temp_t))
             next_tokens_t = torch.tensor(next_tokens, dtype=torch.int64, device=self.device)
             speculations[:, step + 1] = next_tokens_t
 

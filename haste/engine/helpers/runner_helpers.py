@@ -4,13 +4,36 @@ import torch
 from haste.engine.sequence import Sequence
 
 
+def _move_tensor_to_device(
+    tensor: torch.Tensor,
+    device: torch.device | None,
+    *,
+    non_blocking: bool = False,
+    transfer_recorder=None,
+) -> torch.Tensor:
+    """Move a tensor to the target device and optionally record H2D transfer timing."""
+    if device is None or tensor.device == device:
+        return tensor
+    if transfer_recorder is not None and tensor.device.type == "cpu" and device.type == "cuda":
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        moved = tensor.to(device, non_blocking=non_blocking)
+        end_event.record()
+        transfer_recorder("h2d", start_event, end_event, tensor.numel() * tensor.element_size())
+        return moved
+    return tensor.to(device, non_blocking=non_blocking)
+
+
 def prepare_decode_tensors_from_seqs(
     seqs: list[Sequence],
     block_size: int,
     is_draft: bool,
     verify: bool = False,
     k: int = 1,
-    device: torch.device = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device: torch.device = None,
+    transfer_recorder=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare tensors for decoding operations.
     
     Args:
@@ -73,17 +96,38 @@ def prepare_decode_tensors_from_seqs(
     
     pin_memory = device is not None and device.type == "cuda"
     
-    input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
-    positions = torch.tensor(positions, dtype=torch.int64, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
-    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
-    context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
+    input_ids = _move_tensor_to_device(
+        torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
+    positions = _move_tensor_to_device(
+        torch.tensor(positions, dtype=torch.int64, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
+    slot_mapping = _move_tensor_to_device(
+        torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
+    context_lens = _move_tensor_to_device(
+        torch.tensor(context_lens, dtype=torch.int32, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
     
     return input_ids, positions, slot_mapping, context_lens
 
 
 def prepare_block_tables_from_seqs(seqs: list[Sequence], 
                                    is_draft: bool = False, 
-                                   device: torch.device = None) -> torch.Tensor:
+                                   device: torch.device = None,
+                                   transfer_recorder=None) -> torch.Tensor:
     """Convert sequence block tables to tensors.
     
     Args:
@@ -105,13 +149,19 @@ def prepare_block_tables_from_seqs(seqs: list[Sequence],
     # pin_memory is only effective for CUDA devices
     pin_memory = device is not None and device.type == "cuda"
     
-    block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
+    block_tables = _move_tensor_to_device(
+        torch.tensor(block_tables, dtype=torch.int32, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
     
     return block_tables
 
 
 def prepare_prefill_tensors_from_seqs(seqs: list[Sequence], block_size: int, is_draft: bool = False, 
-                                      skip_first_token: bool = False, device: torch.device = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                                      skip_first_token: bool = False, device: torch.device = None,
+                                      transfer_recorder=None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare tensors for prefill operations.
     
     Args:
@@ -166,10 +216,35 @@ def prepare_prefill_tensors_from_seqs(seqs: list[Sequence], block_size: int, is_
     pin_memory = device is not None and device.type == "cuda"
     
     # Convert to tensors
-    input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
-    positions = torch.tensor(positions, dtype=torch.int64, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
-    cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
-    cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
-    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=pin_memory).to(device, non_blocking=pin_memory)
+    input_ids = _move_tensor_to_device(
+        torch.tensor(input_ids, dtype=torch.int64, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
+    positions = _move_tensor_to_device(
+        torch.tensor(positions, dtype=torch.int64, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
+    cu_seqlens_q = _move_tensor_to_device(
+        torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
+    cu_seqlens_k = _move_tensor_to_device(
+        torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
+    slot_mapping = _move_tensor_to_device(
+        torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=pin_memory),
+        device,
+        non_blocking=pin_memory,
+        transfer_recorder=transfer_recorder,
+    )
    
     return input_ids, positions, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping

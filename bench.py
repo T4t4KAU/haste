@@ -384,6 +384,7 @@ def print_profile_summary(report: dict[str, Any]) -> None:
     acceptance = report["acceptance"]
     stages = report["stages"]
     runners = report["runners"]
+    communication = report.get("communication", {})
     metadata = report.get("metadata", {})
     mode = metadata.get("mode", "spec_async")
 
@@ -401,6 +402,16 @@ def print_profile_summary(report: dict[str, Any]) -> None:
         print(f"Average cache hit rate: {cache['avg_hit_rate']:.2%}")
     if mode in {"spec_sync", "spec_async"} and acceptance["avg_accepted_spec_fraction"] is not None:
         print(f"Accepted speculative fraction: {acceptance['avg_accepted_spec_fraction']:.2%}")
+    if communication.get("total_ms", 0.0) > 0.0:
+        total_bytes_gib = communication.get("total_bytes", 0) / (1024 ** 3)
+        print(
+            "CPU/GPU communication: "
+            f"{communication['total_ms']:.2f} ms total "
+            f"({communication.get('wall_ratio', 0.0):.2%} of wall), "
+            f"H2D {communication.get('cpu_to_gpu_ms', 0.0):.2f} ms, "
+            f"D2H {communication.get('gpu_to_cpu_ms', 0.0):.2f} ms, "
+            f"bytes {total_bytes_gib:.3f} GiB"
+        )
 
     print_series_summary("Engine step", stages["engine_step_ms"], "ms")
     print_series_summary("Scheduler", stages["scheduler_ms"], "ms")
@@ -424,8 +435,13 @@ def print_profile_summary(report: dict[str, Any]) -> None:
                 f"final K={draft_worker.get('final_effective_k')} "
                 f"final F={draft_worker.get('final_effective_f')}"
             )
-        print_series_summary("Draft request wait", draft_worker.get("request_wait_ms", {}), "ms")
-        print_series_summary("Draft exposed wait", draft_worker.get("exposed_wait_ms", {}), "ms")
+        print_series_summary("Target wait for draft", draft_worker.get("target_wait_for_draft_ms", {}), "ms")
+        print_series_summary(
+            "Target exposed wait for draft",
+            draft_worker.get("target_exposed_wait_for_draft_ms", {}),
+            "ms",
+        )
+        print_series_summary("Draft wait for target", draft_worker.get("draft_wait_for_target_ms", {}), "ms")
         print_series_summary("Draft worker serve", draft_worker.get("worker_serve_ms", {}), "ms")
         print_series_summary("Draft cache populate", draft_worker.get("cache_populate_ms", {}), "ms")
         print_series_summary("Effective lookahead", draft_worker.get("effective_lookahead", {}))

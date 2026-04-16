@@ -143,6 +143,7 @@ class DraftRunner(ModelRunner):
         self._worker_profile = {
             "request_wait_times": [],
             "exposed_wait_times": [],
+            "draft_wait_for_target_times": [],
             "worker_total_times": [],
             "worker_serve_times": [],
             "cache_populate_times": [],
@@ -154,7 +155,12 @@ class DraftRunner(ModelRunner):
             "tree_cache_sizes": [],
             "effective_lookaheads": [],
             "effective_fan_out_caps": [],
+            "transfer_h2d_times": [],
+            "transfer_d2h_times": [],
+            "transfer_h2d_bytes": [],
+            "transfer_d2h_bytes": [],
         }
+        self._worker_pending_transfer_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event, int]] = []
 
     def _maybe_pin_cpu(self, tensor: torch.Tensor) -> torch.Tensor:
         """Pin CPU tensors when CUDA is available to speed host/device transfers."""
@@ -191,8 +197,63 @@ class DraftRunner(ModelRunner):
         if tensor.device.type == "cpu":
             return self._maybe_pin_cpu(tensor)
         cpu_tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
         cpu_tensor.copy_(tensor, non_blocking=False)
+        end_event.record()
+        self._record_worker_transfer_event("d2h", start_event, end_event, tensor.numel() * tensor.element_size())
         return cpu_tensor
+
+    def _record_worker_transfer_event(
+        self,
+        direction: str,
+        start_event: torch.cuda.Event,
+        end_event: torch.cuda.Event,
+        num_bytes: int,
+    ) -> None:
+        """Queue a worker-side CUDA transfer event for deferred aggregation."""
+        if self.device.type != "cuda":
+            return
+        self._worker_pending_transfer_events.append((direction, start_event, end_event, int(num_bytes)))
+
+    def _flush_worker_transfer_events(self) -> None:
+        """Flush queued worker-side CUDA transfer events."""
+        if self.device.type != "cuda" or not self._worker_pending_transfer_events:
+            return
+        torch.cuda.synchronize(self.device)
+        pending = self._worker_pending_transfer_events
+        self._worker_pending_transfer_events = []
+        for direction, start_event, end_event, num_bytes in pending:
+            elapsed_sec = max(0.0, start_event.elapsed_time(end_event) / 1000.0)
+            self._worker_profile[f"transfer_{direction}_times"].append(elapsed_sec)
+            self._worker_profile[f"transfer_{direction}_bytes"].append(num_bytes)
+
+    def _worker_move_to_device(self, tensor: torch.Tensor | None, *, non_blocking: bool = False) -> torch.Tensor | None:
+        """Move a CPU tensor to the worker device and record H2D transfer time."""
+        if tensor is None or tensor.device == self.device:
+            return tensor
+        if self.device.type == "cuda" and tensor.device.type == "cpu":
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            moved = tensor.to(self.device, non_blocking=non_blocking)
+            end_event.record()
+            self._record_worker_transfer_event("h2d", start_event, end_event, tensor.numel() * tensor.element_size())
+            return moved
+        return tensor.to(self.device, non_blocking=non_blocking)
+
+    def _worker_tensor_to_list(self, tensor: torch.Tensor) -> list:
+        """Convert a tensor to a list and record GPU->CPU transfer time."""
+        if tensor.device.type != "cuda":
+            return tensor.tolist()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        values = tensor.tolist()
+        end_event.record()
+        self._record_worker_transfer_event("d2h", start_event, end_event, tensor.numel() * tensor.element_size())
+        return values
 
     def worker_profile_summary(self) -> dict:
         """Get worker profile summary.
@@ -200,6 +261,7 @@ class DraftRunner(ModelRunner):
         Returns:
             dict: Worker profile summary
         """
+        self._flush_worker_transfer_events()
         summary = build_draft_worker_profile_summary(self._worker_profile, device=str(self.device))
         summary["auto_tune_enabled"] = self.config.async_auto_tune
         summary["static_speculate_k"] = self.config.speculate_k
@@ -980,7 +1042,10 @@ class DraftRunner(ModelRunner):
             if cached_state.gpu_speculation is not None:
                 speculations[idx] = cached_state.gpu_speculation[: lookahead + 1]
             else:
-                speculations[idx] = cached_state.speculation[: lookahead + 1].to(self.device, non_blocking=True)
+                speculations[idx] = self._worker_move_to_device(
+                    cached_state.speculation[: lookahead + 1],
+                    non_blocking=True,
+                )
 
             expected_width = sum(fan_out_list)
             if self._needs_hit_logits(seqs[idx]) or cached_state.fork_width < expected_width:
@@ -1098,8 +1163,8 @@ class DraftRunner(ModelRunner):
         if computed_indices:
             assert computed_all_logits is not None
             computed_index_t = torch.tensor(computed_indices, dtype=torch.long, device=self.device)
-            computed_cache_hits = response.cache_hits.to(self.device)[computed_index_t]
-            computed_speculations = response.speculations.to(self.device)[computed_index_t]
+            computed_cache_hits = self._worker_move_to_device(response.cache_hits)[computed_index_t]
+            computed_speculations = self._worker_move_to_device(response.speculations)[computed_index_t]
             computed_forked_recovery_tokens = get_forked_recovery_tokens_from_logits(
                 self.config,
                 computed_all_logits,
@@ -1111,7 +1176,9 @@ class DraftRunner(ModelRunner):
                 lookahead=lookahead,
             )
             for local_idx, batch_idx in enumerate(computed_indices):
-                forked_recovery_tokens_by_idx[batch_idx] = computed_forked_recovery_tokens[local_idx].tolist()
+                forked_recovery_tokens_by_idx[batch_idx] = self._worker_tensor_to_list(
+                    computed_forked_recovery_tokens[local_idx]
+                )
 
         branch_token_batches: list[list[int]] = []
         branch_recovery_tokens: list[int] = []
@@ -1156,7 +1223,7 @@ class DraftRunner(ModelRunner):
                 min(lookahead, max(1, self.config.async_fast_populate_steps)),
                 fan_out_list,
             )
-            branch_fork_recovery_tokens = self._maybe_pin_cpu(branch_fork_recovery_tokens.cpu())
+            branch_fork_recovery_tokens = self._to_cpu_pinned(branch_fork_recovery_tokens)
         elif all(temperature == 0 for temperature in branch_temperatures):
             branch_specs, _, _, branch_fork_recovery_tokens = self.speculate_stateless_batch(
                 branch_token_batches,
@@ -1168,7 +1235,7 @@ class DraftRunner(ModelRunner):
                 fork_counts=fan_out_list,
             )
             assert branch_fork_recovery_tokens is not None
-            branch_fork_recovery_tokens = self._maybe_pin_cpu(branch_fork_recovery_tokens.cpu())
+            branch_fork_recovery_tokens = self._to_cpu_pinned(branch_fork_recovery_tokens)
         else:
             branch_specs, _, branch_all_logits, _ = self.speculate_stateless_batch(
                 branch_token_batches,
@@ -1189,9 +1256,9 @@ class DraftRunner(ModelRunner):
                 fan_out_list_miss=fan_out_list_miss,
                 lookahead=lookahead,
             )
-            branch_fork_recovery_tokens = self._maybe_pin_cpu(branch_fork_recovery_tokens.cpu())
+            branch_fork_recovery_tokens = self._to_cpu_pinned(branch_fork_recovery_tokens)
 
-        branch_specs_cpu = self._maybe_pin_cpu(branch_specs.cpu())
+        branch_specs_cpu = self._to_cpu_pinned(branch_specs)
         gpu_cache = branch_specs if self._should_keep_gpu_cache(branch_specs) else None
         self._tree_cache = {
             key: CachedDraftState(
@@ -1212,14 +1279,21 @@ class DraftRunner(ModelRunner):
             cuda_index = 0 if self.device.index is None else self.device.index
             torch.cuda.set_device(cuda_index)
 
+        previous_speculate_completed = False
         while True:
+            wait_start = time.perf_counter()
             request: DraftRequest = self._request_queue.get()
+            wait_elapsed = time.perf_counter() - wait_start
+
+            if request.kind == "speculate" and previous_speculate_completed:
+                self._worker_profile["draft_wait_for_target_times"].append(wait_elapsed)
 
             if request.kind == "shutdown":
                 break
 
             if request.kind == "prefill":
                 self._tree_cache.clear()
+                previous_speculate_completed = False
                 continue
 
             if request.kind != "speculate":
@@ -1255,6 +1329,7 @@ class DraftRunner(ModelRunner):
                 self._worker_profile["fast_populate_flags"].append(1 if used_fast_populate else 0)
                 self._worker_profile["worker_batch_sizes"].append(len(request.seqs))
                 self._worker_profile["tree_cache_sizes"].append(len(self._tree_cache))
+                previous_speculate_completed = True
             except Exception as exc:  # pragma: no cover - surfaced to caller
                 self._worker_error = exc
                 request.response_q.put(exc)

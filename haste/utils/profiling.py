@@ -175,12 +175,24 @@ def build_runner_profile_summary(
     Returns:
         dict[str, Any]: Runner profile summary
     """
+    transfer_h2d = snapshot.get("transfer_h2d_times", [])
+    transfer_d2h = snapshot.get("transfer_d2h_times", [])
+    transfer_h2d_bytes = snapshot.get("transfer_h2d_bytes", [])
+    transfer_d2h_bytes = snapshot.get("transfer_d2h_bytes", [])
     return {
         "device": device,
         "is_draft": is_draft,
         "prefill": build_runner_mode_summary(snapshot, "prefill"),
         "decode": build_runner_mode_summary(snapshot, "decode"),
         "verify": build_runner_mode_summary(snapshot, "verify"),
+        "communication": {
+            "cpu_to_gpu_ms": summarize_numeric_series(transfer_h2d, scale=1000.0),
+            "gpu_to_cpu_ms": summarize_numeric_series(transfer_d2h, scale=1000.0),
+            "cpu_to_gpu_bytes": summarize_numeric_series(transfer_h2d_bytes),
+            "gpu_to_cpu_bytes": summarize_numeric_series(transfer_d2h_bytes),
+            "total_time_sec": sum(transfer_h2d) + sum(transfer_d2h),
+            "total_bytes": sum(transfer_h2d_bytes) + sum(transfer_d2h_bytes),
+        },
     }
 
 
@@ -194,10 +206,23 @@ def build_draft_worker_profile_summary(snapshot: dict[str, Any], *, device: str)
     Returns:
         dict[str, Any]: Draft worker profile summary
     """
+    transfer_h2d = snapshot.get("transfer_h2d_times", [])
+    transfer_d2h = snapshot.get("transfer_d2h_times", [])
+    transfer_h2d_bytes = snapshot.get("transfer_h2d_bytes", [])
+    transfer_d2h_bytes = snapshot.get("transfer_d2h_bytes", [])
     return {
         "device": device,
         "request_wait_ms": summarize_numeric_series(snapshot["request_wait_times"], scale=1000.0),
         "exposed_wait_ms": summarize_numeric_series(snapshot.get("exposed_wait_times", []), scale=1000.0),
+        "target_wait_for_draft_ms": summarize_numeric_series(snapshot["request_wait_times"], scale=1000.0),
+        "target_exposed_wait_for_draft_ms": summarize_numeric_series(
+            snapshot.get("exposed_wait_times", []),
+            scale=1000.0,
+        ),
+        "draft_wait_for_target_ms": summarize_numeric_series(
+            snapshot.get("draft_wait_for_target_times", []),
+            scale=1000.0,
+        ),
         "worker_total_ms": summarize_numeric_series(snapshot["worker_total_times"], scale=1000.0),
         "worker_serve_ms": summarize_numeric_series(snapshot["worker_serve_times"], scale=1000.0),
         "cache_populate_ms": summarize_numeric_series(snapshot["cache_populate_times"], scale=1000.0),
@@ -212,6 +237,60 @@ def build_draft_worker_profile_summary(snapshot: dict[str, Any], *, device: str)
         "tree_cache_size": summarize_numeric_series(snapshot["tree_cache_sizes"]),
         "effective_lookahead": summarize_numeric_series(snapshot.get("effective_lookaheads", [])),
         "effective_fan_out_cap": summarize_numeric_series(snapshot.get("effective_fan_out_caps", [])),
+        "communication": {
+            "cpu_to_gpu_ms": summarize_numeric_series(transfer_h2d, scale=1000.0),
+            "gpu_to_cpu_ms": summarize_numeric_series(transfer_d2h, scale=1000.0),
+            "cpu_to_gpu_bytes": summarize_numeric_series(transfer_h2d_bytes),
+            "gpu_to_cpu_bytes": summarize_numeric_series(transfer_d2h_bytes),
+            "total_time_sec": sum(transfer_h2d) + sum(transfer_d2h),
+            "total_bytes": sum(transfer_h2d_bytes) + sum(transfer_d2h_bytes),
+        },
+    }
+
+
+def _aggregate_communication_summary(runners: dict[str, Any], wall_time_sec: float) -> dict[str, Any]:
+    """Aggregate communication summaries from all runner profiles."""
+    total_h2d_sec = 0.0
+    total_d2h_sec = 0.0
+    total_h2d_bytes = 0
+    total_d2h_bytes = 0
+    by_runner: dict[str, Any] = {}
+
+    for name, runner in runners.items():
+        communication = runner.get("communication", {})
+        runner_h2d_sec = float(communication.get("cpu_to_gpu_ms", {}).get("sum", 0.0)) / 1000.0
+        runner_d2h_sec = float(communication.get("gpu_to_cpu_ms", {}).get("sum", 0.0)) / 1000.0
+        runner_h2d_bytes = int(communication.get("cpu_to_gpu_bytes", {}).get("sum", 0))
+        runner_d2h_bytes = int(communication.get("gpu_to_cpu_bytes", {}).get("sum", 0))
+        runner_total_sec = runner_h2d_sec + runner_d2h_sec
+        runner_total_bytes = runner_h2d_bytes + runner_d2h_bytes
+
+        if runner_total_sec <= 0.0 and runner_total_bytes <= 0:
+            continue
+
+        total_h2d_sec += runner_h2d_sec
+        total_d2h_sec += runner_d2h_sec
+        total_h2d_bytes += runner_h2d_bytes
+        total_d2h_bytes += runner_d2h_bytes
+        by_runner[name] = {
+            "cpu_to_gpu_ms": runner_h2d_sec * 1000.0,
+            "gpu_to_cpu_ms": runner_d2h_sec * 1000.0,
+            "total_ms": runner_total_sec * 1000.0,
+            "cpu_to_gpu_bytes": runner_h2d_bytes,
+            "gpu_to_cpu_bytes": runner_d2h_bytes,
+            "total_bytes": runner_total_bytes,
+        }
+
+    total_sec = total_h2d_sec + total_d2h_sec
+    return {
+        "cpu_to_gpu_ms": total_h2d_sec * 1000.0,
+        "gpu_to_cpu_ms": total_d2h_sec * 1000.0,
+        "total_ms": total_sec * 1000.0,
+        "cpu_to_gpu_bytes": total_h2d_bytes,
+        "gpu_to_cpu_bytes": total_d2h_bytes,
+        "total_bytes": total_h2d_bytes + total_d2h_bytes,
+        "wall_ratio": safe_divide(total_sec, wall_time_sec),
+        "by_runner": by_runner,
     }
 
 
@@ -256,6 +335,7 @@ def build_profile_report(
         effective_spec_budget = speculative_steps * speculate_k
 
     cache_hits = metrics.get("cache_hits", [])
+    runners = metrics.get("runner_profiles", {})
     report = {
         "metadata": metadata or {},
         "totals": {
@@ -312,7 +392,8 @@ def build_profile_report(
             "postprocess_ms": summarize_numeric_series(metrics.get("postprocess_times", []), scale=1000.0),
             "target_verify_ms": summarize_numeric_series(metrics.get("target_verify_times", []), scale=1000.0),
         },
-        "runners": metrics.get("runner_profiles", {}),
+        "runners": runners,
+        "communication": _aggregate_communication_summary(runners, total_wall_time),
     }
 
     if include_raw_metrics:
