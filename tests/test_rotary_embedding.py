@@ -9,7 +9,7 @@ if str(ROOT) not in sys.path:
 import torch
 
 from haste.layers.rotary_embedding import get_rope
-from haste.models.qwen3 import _extract_rope_scaling
+from haste.models.qwen3 import _extract_rope_scaling, _uses_qk_norm, _uses_qkv_bias
 
 
 class RotaryEmbeddingTest(unittest.TestCase):
@@ -67,6 +67,22 @@ class RotaryEmbeddingTest(unittest.TestCase):
         self.assertEqual(rope_scaling["rope_type"], "linear")
         self.assertEqual(rope_scaling["factor"], 2.0)
         self.assertEqual(rope_scaling["rope_theta"], 1000000)
+
+    def test_qwen2_uses_attention_bias_but_not_qk_norm(self):
+        class DummyConfig:
+            model_type = "qwen2"
+            attention_bias = None
+
+        self.assertTrue(_uses_qkv_bias(DummyConfig()))
+        self.assertFalse(_uses_qk_norm(DummyConfig()))
+
+    def test_qwen3_uses_qk_norm_without_attention_bias(self):
+        class DummyConfig:
+            model_type = "qwen3"
+            attention_bias = False
+
+        self.assertFalse(_uses_qkv_bias(DummyConfig()))
+        self.assertTrue(_uses_qk_norm(DummyConfig()))
 
 
 if __name__ == "__main__":

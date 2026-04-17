@@ -225,7 +225,7 @@ class ModelRunner:
         Returns:
             nn.Module: Built model
         """
-        if hf_config.model_type == "qwen3":
+        if hf_config.model_type in {"qwen2", "qwen3"}:
             from haste.models.qwen3 import Qwen3ForCausalLM
             model = Qwen3ForCausalLM(
                 config=hf_config,
@@ -324,12 +324,15 @@ class ModelRunner:
         """Allocate KV cache for draft model."""
         free, _ = torch.cuda.mem_get_info(device=self.device)
         num_kv_heads = self.hf_config.num_key_value_heads
+        head_dim = getattr(self.hf_config, "head_dim", None) or (
+            self.hf_config.hidden_size // self.hf_config.num_attention_heads
+        )
         block_bytes = (
             2
             * self.hf_config.num_hidden_layers
             * self.block_size
             * num_kv_heads
-            * self.hf_config.head_dim
+            * head_dim
             * self.hf_config.torch_dtype.itemsize
         )
         usable_bytes = free * self.config.gpu_memory_utilization
@@ -342,7 +345,7 @@ class ModelRunner:
             self.config.num_kvcache_blocks,
             self.block_size,
             num_kv_heads,
-            self.hf_config.head_dim,
+            head_dim,
             device=self.device,
             dtype=self.hf_config.torch_dtype,
         )
@@ -353,12 +356,15 @@ class ModelRunner:
         mem = psutil.virtual_memory()
         free = mem.available
         num_kv_heads = self.hf_config.num_key_value_heads
+        head_dim = getattr(self.hf_config, "head_dim", None) or (
+            self.hf_config.hidden_size // self.hf_config.num_attention_heads
+        )
         block_bytes = (
             2
             * self.hf_config.num_hidden_layers
             * self.block_size
             * num_kv_heads
-            * self.hf_config.head_dim
+            * head_dim
             * self.hf_config.torch_dtype.itemsize
         )
         usable_bytes = free * self.config.cpu_memory_utilization
@@ -371,7 +377,7 @@ class ModelRunner:
             self.config.num_kvcache_blocks,
             self.block_size,
             num_kv_heads,
-            self.hf_config.head_dim,
+            head_dim,
             device=self.device,
             dtype=self.hf_config.torch_dtype,
         )

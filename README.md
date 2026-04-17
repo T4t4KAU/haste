@@ -9,7 +9,7 @@ Haste is a high-performance LLM inference engine that implements asynchronous sp
 - **Low VRAM Requirements**: Designed for edge devices with limited GPU memory
 - **Auto-tuning**: Dynamically adjusts speculative parameters for optimal performance
 - **Progress Bar Support**: Visual generation progress with `--use-tqdm` parameter
-- **Multi-Model Support**: Now supports Qwen3, Llama3.2, and SmolLM2 models
+- **Multi-Model Support**: Now supports Qwen2.5, Qwen3, Llama3.2, and SmolLM2 models
 
 ## Installation
 
@@ -200,6 +200,7 @@ Haste supports two profiling modes:
 
 Haste currently supports the following models:
 
+- **Qwen2.5**: Tested with Qwen2.5-3B-Instruct (target) and Qwen2.5-0.5B-Instruct (draft)
 - **Qwen3**: Any Qwen3 model as target, smaller Qwen3 as draft
 - **Llama3.2**: Tested with Llama-3.2-3B (target) and Llama-3.2-1B (draft)
 - **SmolLM2**: Tested with SmolLM2-1.7B (target) and SmolLM2-135M (draft)

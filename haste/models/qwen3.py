@@ -1,9 +1,14 @@
-"""Qwen3 model implementation."""
+"""Shared Qwen-family model implementation.
+
+This implementation currently covers:
+- Qwen2 / Qwen2.5 style decoder-only models
+- Qwen3 style decoder-only models
+"""
 
 import torch
 from torch import nn
 import torch.distributed as dist
-from transformers import Qwen3Config
+from transformers import PretrainedConfig
 
 from haste.layers.activation import SiluAndMul
 from haste.layers.attention import Attention
@@ -13,7 +18,7 @@ from haste.layers.rotary_embedding import get_rope
 from haste.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
-def _extract_rope_scaling(config: Qwen3Config) -> dict | None:
+def _extract_rope_scaling(config: PretrainedConfig) -> dict | None:
     """Normalize RoPE scaling settings across transformers versions.
 
     Some environments expose Qwen3 long-context settings through
@@ -49,11 +54,21 @@ def _extract_rope_scaling(config: Qwen3Config) -> dict | None:
     return normalized
 
 
+def _uses_qk_norm(config: PretrainedConfig) -> bool:
+    """Return whether the Qwen variant uses per-head q/k normalization."""
+    return getattr(config, "model_type", "") == "qwen3"
+
+
+def _uses_qkv_bias(config: PretrainedConfig) -> bool:
+    """Return whether the Qwen variant expects q/k/v projection bias terms."""
+    attention_bias = getattr(config, "attention_bias", None)
+    if attention_bias is not None:
+        return bool(attention_bias)
+    return getattr(config, "model_type", "") == "qwen2"
+
+
 class Qwen3Attention(nn.Module):
-    """Qwen3 attention module.
-    
-    This class implements the attention mechanism for Qwen3 model.
-    """
+    """Qwen-family attention module."""
 
     def __init__( 
         self,
@@ -66,6 +81,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
+        use_qk_norm: bool = True,
         rotary_emb: nn.Module | None = None,
         # speculation args 
         draft: bool = False,
@@ -86,6 +102,7 @@ class Qwen3Attention(nn.Module):
             qkv_bias (bool, optional): Whether to use bias in QKV projection. Defaults to False.
             rope_theta (float, optional): Theta for RoPE. Defaults to 10000.
             rope_scaling (tuple | None, optional): RoPE scaling. Defaults to None.
+            use_qk_norm (bool, optional): Whether q/k head normalization is enabled.
             draft (bool, optional): Whether this is a draft model. Defaults to False.
             speculate (bool, optional): Whether to use speculative decoding. Defaults to False.
             spec_k (int, optional): Speculation length. Defaults to 1.
@@ -95,6 +112,7 @@ class Qwen3Attention(nn.Module):
         super().__init__()
         self.draft = draft
         self.draft_async = draft_async
+        self.use_qk_norm = use_qk_norm
 
         self.total_num_heads = num_heads
         self.num_heads = self.total_num_heads
@@ -135,8 +153,8 @@ class Qwen3Attention(nn.Module):
             F=async_fan_out,
             K=spec_k,
         )
-        self.q_norm = RMSHeadNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSHeadNorm(self.head_dim, eps=rms_norm_eps)
+        self.q_norm = RMSHeadNorm(self.head_dim, eps=rms_norm_eps) if use_qk_norm else nn.Identity()
+        self.k_norm = RMSHeadNorm(self.head_dim, eps=rms_norm_eps) if use_qk_norm else nn.Identity()
 
     def forward(
             self,
@@ -224,7 +242,7 @@ class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+            config: PretrainedConfig,
         rotary_emb: nn.Module | None,
         draft: bool,
         speculate: bool,
@@ -235,7 +253,7 @@ class Qwen3DecoderLayer(nn.Module):
         """Initialize the Qwen3DecoderLayer module.
         
         Args:
-            config (Qwen3Config): Model configuration
+            config (PretrainedConfig): Model configuration
             draft (bool): Whether this is a draft model
             speculate (bool): Whether to use speculative decoding
             spec_k (int): Speculation length
@@ -254,10 +272,11 @@ class Qwen3DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', False),
+            qkv_bias=_uses_qkv_bias(config),
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=_extract_rope_scaling(config),
+            use_qk_norm=_uses_qk_norm(config),
             rotary_emb=rotary_emb,
             draft=self.draft,
             speculate=self.speculate,
@@ -309,7 +328,7 @@ class Qwen3Model(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: PretrainedConfig,
         draft: bool = False,
         speculate: bool = False,
         spec_k: int = 1,
@@ -319,7 +338,7 @@ class Qwen3Model(nn.Module):
         """Initialize the Qwen3Model module.
         
         Args:
-            config (Qwen3Config): Model configuration
+            config (PretrainedConfig): Model configuration
             draft (bool, optional): Whether this is a draft model. Defaults to False.
             speculate (bool, optional): Whether to use speculative decoding. Defaults to False.
             spec_k (int, optional): Speculation length. Defaults to 1.
@@ -381,10 +400,7 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    """Qwen3 model for causal language modeling.
-    
-    This class implements the Qwen3 model for causal language modeling tasks.
-    """
+    """Qwen-family model for causal language modeling."""
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -395,7 +411,7 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config, 
+        config: PretrainedConfig,
         draft: bool = False,
         speculate: bool = False,
         use_eagle: bool = False,
@@ -407,7 +423,7 @@ class Qwen3ForCausalLM(nn.Module):
         """Initialize the Qwen3ForCausalLM module.
         
         Args:
-            config (Qwen3Config): Model configuration
+            config (PretrainedConfig): Model configuration
             draft (bool, optional): Whether this is a draft model. Defaults to False.
             speculate (bool, optional): Whether to use speculative decoding. Defaults to False.
             use_eagle (bool, optional): Whether to use Eagle optimization. Defaults to False.
@@ -423,13 +439,13 @@ class Qwen3ForCausalLM(nn.Module):
 
         if auto_tune_kf:
             print(
-                "Starting Qwen3ForCausalLM init, "
+                "Starting QwenForCausalLM init, "
                 f"draft={draft}, speculate={speculate}, "
                 f"spec_k={spec_k}, async_fan_out={async_fan_out}, auto_tune_kf=True"
             )
         else:
             print(
-                "Starting Qwen3ForCausalLM init, "
+                "Starting QwenForCausalLM init, "
                 f"draft={draft}, speculate={speculate}, "
                 f"spec_k={spec_k}, async_fan_out={async_fan_out}"
             )
@@ -444,13 +460,13 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
         if auto_tune_kf:
             print(
-                "Finishing Qwen3ForCausalLM init, "
+                "Finishing QwenForCausalLM init, "
                 f"draft={draft}, speculate={speculate}, "
                 f"spec_k={spec_k}, async_fan_out={async_fan_out}, auto_tune_kf=True"
             )
         else:
             print(
-                "Finishing Qwen3ForCausalLM init, "
+                "Finishing QwenForCausalLM init, "
                 f"draft={draft}, speculate={speculate}, "
                 f"spec_k={spec_k}, async_fan_out={async_fan_out}"
             )
