@@ -3,9 +3,10 @@
 This script:
 1. Loads prompts from local JSONL datasets.
 2. Queries a local OpenAI-compatible model endpoint for candidate answers.
-3. Uses a stronger remote judge model to score those answers with templates from
+3. Uses a stronger remote judge model to score answer quality with templates from
    ``datasets/judge_prompts.jsonl``.
-4. Reports judge-based average score and pass-rate style accuracy.
+4. Separately computes dataset-aware task accuracy when a sample has an objective
+   reference answer (for example, GSM8K exact-match on the final numeric answer).
 """
 
 from __future__ import annotations
@@ -14,7 +15,10 @@ import argparse
 import json
 import os
 import re
+import string
 import time
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -32,6 +36,10 @@ CANDIDATE_SYSTEM_PROMPT = (
 )
 
 SCORE_PATTERN = re.compile(r"\[\[(\d+)\]\]")
+BOXED_ANSWER_PATTERN = re.compile(r"\\boxed\{([^{}]+)\}")
+NUMERIC_ANSWER_PATTERN = re.compile(r"[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:/\d+)?")
+ARTICLE_PATTERN = re.compile(r"\b(a|an|the)\b")
+SHORT_REFERENCE_TOKEN_LIMIT = 12
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -314,6 +322,196 @@ def parse_judge_score(text: str) -> int:
     return score
 
 
+def _ensure_reference_list(reference: Any) -> list[str]:
+    """Normalize a sample reference field into a list of strings."""
+    if reference is None:
+        return []
+    if isinstance(reference, list):
+        return [str(item) for item in reference]
+    return [str(reference)]
+
+
+def normalize_whitespace(text: str) -> str:
+    """Collapse consecutive whitespace into single spaces."""
+    return " ".join(str(text).split())
+
+
+def normalize_short_text_answer(text: str) -> str:
+    """Normalize short factual answers for EM-style matching."""
+    normalized = str(text).lower()
+    normalized = normalized.translate(str.maketrans("", "", string.punctuation))
+    normalized = ARTICLE_PATTERN.sub(" ", normalized)
+    return normalize_whitespace(normalized)
+
+
+def is_short_reference_answer(text: str) -> bool:
+    """Heuristic for objective short-form references such as entity names."""
+    text = str(text).strip()
+    if not text or "\n" in text:
+        return False
+    return len(text.split()) <= SHORT_REFERENCE_TOKEN_LIMIT
+
+
+def normalize_numeric_token(token: str) -> str:
+    """Canonicalize integers, decimals, and simple fractions."""
+    token = str(token).strip().strip("`")
+    token = token.strip("()[]{}<>")
+    token = token.lstrip("$")
+    token = token.rstrip(".,;:!?")
+    token = token.replace(",", "")
+    if not token:
+        return ""
+
+    if re.fullmatch(r"[-+]?\d+/\d+", token):
+        fraction = Fraction(token)
+        if fraction.denominator == 1:
+            return str(fraction.numerator)
+        return f"{fraction.numerator}/{fraction.denominator}"
+
+    try:
+        decimal_value = Decimal(token)
+    except InvalidOperation:
+        return normalize_whitespace(token)
+
+    if decimal_value == decimal_value.to_integral():
+        return str(int(decimal_value))
+
+    normalized = format(decimal_value.normalize(), "f")
+    normalized = normalized.rstrip("0").rstrip(".")
+    if normalized in {"-0", "+0", ""}:
+        return "0"
+    return normalized
+
+
+def extract_math_final_answer(text: str) -> str:
+    """Extract the most likely final math answer from free-form reasoning text."""
+    text = str(text).strip()
+    if not text:
+        return ""
+
+    if "####" in text:
+        candidate = text.rsplit("####", maxsplit=1)[-1].strip().splitlines()[0]
+        normalized = normalize_numeric_token(candidate)
+        if normalized:
+            return normalized
+
+    boxed_matches = BOXED_ANSWER_PATTERN.findall(text)
+    if boxed_matches:
+        normalized = normalize_numeric_token(boxed_matches[-1])
+        if normalized:
+            return normalized
+
+    nonempty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if nonempty_lines:
+        last_line = nonempty_lines[-1]
+        marker_match = re.search(
+            r"(?:final answer|answer is|answer:)\s*(.+)$",
+            last_line,
+            flags=re.IGNORECASE,
+        )
+        if marker_match:
+            normalized = normalize_numeric_token(marker_match.group(1))
+            if normalized:
+                return normalized
+
+    numeric_matches = NUMERIC_ANSWER_PATTERN.findall(text)
+    if numeric_matches:
+        return normalize_numeric_token(numeric_matches[-1])
+
+    if nonempty_lines:
+        return normalize_numeric_token(nonempty_lines[-1])
+    return ""
+
+
+def evaluate_turn_correctness(
+    *,
+    answer: str,
+    reference: str,
+    metric_name: str,
+) -> dict[str, Any]:
+    """Evaluate one answer/reference pair with a dataset-appropriate metric."""
+    if metric_name == "math_exact_match":
+        normalized_answer = extract_math_final_answer(answer)
+        normalized_reference = extract_math_final_answer(reference)
+        correct = bool(normalized_answer) and normalized_answer == normalized_reference
+    elif metric_name == "short_text_match":
+        normalized_answer = normalize_short_text_answer(answer)
+        normalized_reference = normalize_short_text_answer(reference)
+        correct = bool(normalized_reference) and (
+            normalized_answer == normalized_reference
+            or normalized_reference in normalized_answer
+        )
+    else:
+        raise ValueError(f"Unsupported task metric: {metric_name}")
+
+    return {
+        "metric_name": metric_name,
+        "correct": correct,
+        "normalized_answer": normalized_answer,
+        "normalized_reference": normalized_reference,
+    }
+
+
+def evaluate_sample_correctness(
+    sample: dict[str, Any],
+    *,
+    answers: list[str],
+    dataset_name: str,
+) -> dict[str, Any]:
+    """Evaluate objective task correctness when the dataset supports it."""
+    references = _ensure_reference_list(sample.get("reference"))
+    paired_turns = list(zip(answers, references))
+    if not paired_turns:
+        return {
+            "eligible": False,
+            "metric_name": None,
+            "sample_correct": None,
+            "correct_turns": 0,
+            "eligible_turns": 0,
+            "reason": "missing_reference",
+            "turns": [],
+        }
+
+    if is_math_sample(sample, dataset_name):
+        metric_name = "math_exact_match"
+    elif all(is_short_reference_answer(reference) for _, reference in paired_turns):
+        metric_name = "short_text_match"
+    else:
+        return {
+            "eligible": False,
+            "metric_name": None,
+            "sample_correct": None,
+            "correct_turns": 0,
+            "eligible_turns": 0,
+            "reason": "reference_not_objective_enough",
+            "turns": [],
+        }
+
+    turn_results: list[dict[str, Any]] = []
+    for turn_index, (answer, reference) in enumerate(paired_turns):
+        turn_result = evaluate_turn_correctness(
+            answer=answer,
+            reference=reference,
+            metric_name=metric_name,
+        )
+        turn_result["turn_index"] = turn_index
+        turn_results.append(turn_result)
+
+    correct_turns = sum(turn_result["correct"] for turn_result in turn_results)
+    eligible_turns = len(turn_results)
+    sample_correct = correct_turns == eligible_turns
+
+    return {
+        "eligible": True,
+        "metric_name": metric_name,
+        "sample_correct": sample_correct,
+        "correct_turns": correct_turns,
+        "eligible_turns": eligible_turns,
+        "reason": None,
+        "turns": turn_results,
+    }
+
+
 def request_candidate_chat_completion(
     client,
     *,
@@ -477,7 +675,11 @@ def summarize_results(results: list[dict[str, Any]], *, pass_score: int) -> dict
         return {
             "num_samples": 0,
             "average_score": None,
-            "accuracy": None,
+            "judge_pass_rate": None,
+            "task_accuracy": None,
+            "task_accuracy_eligible_samples": 0,
+            "task_accuracy_correct_samples": 0,
+            "task_metric_distribution": {},
             "pass_score": pass_score,
             "score_distribution": {},
             "per_dataset": {},
@@ -491,21 +693,45 @@ def summarize_results(results: list[dict[str, Any]], *, pass_score: int) -> dict
     for score in scores:
         score_distribution[str(score)] = score_distribution.get(str(score), 0) + 1
 
-    dataset_groups: dict[str, list[int]] = {}
+    eligible_results = [result for result in results if result.get("task_correct") is not None]
+    task_correct = sum(bool(result["task_correct"]) for result in eligible_results)
+    task_metric_distribution: dict[str, int] = {}
+    for result in eligible_results:
+        metric_name = str(result.get("task_metric_name"))
+        task_metric_distribution[metric_name] = task_metric_distribution.get(metric_name, 0) + 1
+
+    dataset_groups: dict[str, list[dict[str, Any]]] = {}
     for result in results:
-        dataset_groups.setdefault(result["dataset"], []).append(result["judge_score"])
-    for dataset_name, dataset_scores in dataset_groups.items():
+        dataset_groups.setdefault(result["dataset"], []).append(result)
+    for dataset_name, dataset_results in dataset_groups.items():
+        dataset_scores = [result["judge_score"] for result in dataset_results]
         dataset_passed = sum(score >= pass_score for score in dataset_scores)
+        dataset_eligible = [result for result in dataset_results if result.get("task_correct") is not None]
+        dataset_task_correct = sum(bool(result["task_correct"]) for result in dataset_eligible)
+        dataset_metric_distribution: dict[str, int] = {}
+        for result in dataset_eligible:
+            metric_name = str(result.get("task_metric_name"))
+            dataset_metric_distribution[metric_name] = dataset_metric_distribution.get(metric_name, 0) + 1
         per_dataset[dataset_name] = {
             "num_samples": len(dataset_scores),
             "average_score": mean(dataset_scores),
-            "accuracy": dataset_passed / len(dataset_scores),
+            "judge_pass_rate": dataset_passed / len(dataset_scores),
+            "task_accuracy": (
+                dataset_task_correct / len(dataset_eligible) if dataset_eligible else None
+            ),
+            "task_accuracy_eligible_samples": len(dataset_eligible),
+            "task_accuracy_correct_samples": dataset_task_correct,
+            "task_metric_distribution": dataset_metric_distribution,
         }
 
     return {
         "num_samples": len(scores),
         "average_score": mean(scores),
-        "accuracy": passed / len(scores),
+        "judge_pass_rate": passed / len(scores),
+        "task_accuracy": task_correct / len(eligible_results) if eligible_results else None,
+        "task_accuracy_eligible_samples": len(eligible_results),
+        "task_accuracy_correct_samples": task_correct,
+        "task_metric_distribution": task_metric_distribution,
         "pass_score": pass_score,
         "min_score": min(scores),
         "max_score": max(scores),
@@ -598,6 +824,11 @@ def main() -> None:
             max_retries=args.judge_max_retries,
             retry_sleep=args.retry_sleep,
         )
+        task_eval = evaluate_sample_correctness(
+            sample,
+            answers=answers,
+            dataset_name=dataset_name,
+        )
 
         result = {
             "dataset": dataset_name,
@@ -609,11 +840,17 @@ def main() -> None:
             "answers": answers,
             "judge_score": score,
             "judge_output": judge_output,
+            "task_metric_name": task_eval["metric_name"],
+            "task_correct": task_eval["sample_correct"],
+            "task_eval": task_eval,
         }
         results.append(result)
 
         if args.verbose:
-            print(f"  -> score={score}", flush=True)
+            correctness_text = "n/a"
+            if task_eval["sample_correct"] is not None:
+                correctness_text = "correct" if task_eval["sample_correct"] else "incorrect"
+            print(f"  -> score={score} task={correctness_text}", flush=True)
 
     summary = summarize_results(results, pass_score=args.pass_score)
     report = {
@@ -641,16 +878,32 @@ def main() -> None:
     print(f"Samples: {summary['num_samples']}")
     if summary["average_score"] is not None:
         print(f"Average judge score: {summary['average_score']:.2f}/10")
-    if summary["accuracy"] is not None:
-        print(f"Accuracy (score >= {args.pass_score}): {summary['accuracy']:.2%}")
+    if summary["task_accuracy"] is not None:
+        print(
+            f"Task accuracy: {summary['task_accuracy']:.2%} "
+            f"({summary['task_accuracy_correct_samples']}/"
+            f"{summary['task_accuracy_eligible_samples']} objective samples)"
+        )
+    else:
+        print("Task accuracy: n/a (no objective reference-based samples in this run)")
+    if summary["judge_pass_rate"] is not None:
+        print(f"Judge pass rate (score >= {args.pass_score}): {summary['judge_pass_rate']:.2%}")
     print(f"Saved report: {output_path.resolve()}")
 
     if summary["per_dataset"]:
         print("\nPer-dataset summary")
         for dataset_name, dataset_summary in summary["per_dataset"].items():
+            task_accuracy_text = "n/a"
+            if dataset_summary["task_accuracy"] is not None:
+                task_accuracy_text = (
+                    f"{dataset_summary['task_accuracy']:.2%} "
+                    f"({dataset_summary['task_accuracy_correct_samples']}/"
+                    f"{dataset_summary['task_accuracy_eligible_samples']})"
+                )
             print(
                 f"- {dataset_name}: avg_score={dataset_summary['average_score']:.2f}, "
-                f"accuracy={dataset_summary['accuracy']:.2%}, "
+                f"judge_pass_rate={dataset_summary['judge_pass_rate']:.2%}, "
+                f"task_accuracy={task_accuracy_text}, "
                 f"samples={dataset_summary['num_samples']}"
             )
 

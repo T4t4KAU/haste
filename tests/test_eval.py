@@ -72,21 +72,74 @@ class EvalHelpersTest(unittest.TestCase):
     def test_parse_judge_score_extracts_marker(self):
         self.assertEqual(eval_module.parse_judge_score("Good answer. Rating: [[8]]"), 8)
 
-    def test_summarize_results_builds_accuracy(self):
+    def test_extract_math_final_answer_uses_reference_marker(self):
+        answer = "Let's compute it carefully.\n#### 109"
+
+        self.assertEqual(eval_module.extract_math_final_answer(answer), "109")
+
+    def test_evaluate_sample_correctness_handles_math_exact_match(self):
+        sample = {
+            "turns": ["Solve 2+2"],
+            "reference": ["The answer is 4.\n#### 4"],
+            "category": "math",
+        }
+
+        correctness = eval_module.evaluate_sample_correctness(
+            sample,
+            answers=["After calculation, the answer is 4."],
+            dataset_name="gsm8k",
+        )
+
+        self.assertTrue(correctness["eligible"])
+        self.assertEqual(correctness["metric_name"], "math_exact_match")
+        self.assertTrue(correctness["sample_correct"])
+
+    def test_evaluate_sample_correctness_uses_short_text_match(self):
+        sample = {
+            "turns": ["Where was the 2015 Rugby World Cup held?"],
+            "reference": ["England"],
+            "category": "qa",
+        }
+
+        correctness = eval_module.evaluate_sample_correctness(
+            sample,
+            answers=["It was held in England."],
+            dataset_name="qa",
+        )
+
+        self.assertTrue(correctness["eligible"])
+        self.assertEqual(correctness["metric_name"], "short_text_match")
+        self.assertTrue(correctness["sample_correct"])
+
+    def test_summarize_results_separates_task_accuracy_from_judge_pass_rate(self):
         summary = eval_module.summarize_results(
             [
-                {"dataset": "alpaca", "judge_score": 8},
-                {"dataset": "alpaca", "judge_score": 6},
-                {"dataset": "gsm8k", "judge_score": 9},
+                {"dataset": "alpaca", "judge_score": 8, "task_correct": None, "task_metric_name": None},
+                {"dataset": "alpaca", "judge_score": 6, "task_correct": None, "task_metric_name": None},
+                {
+                    "dataset": "gsm8k",
+                    "judge_score": 9,
+                    "task_correct": True,
+                    "task_metric_name": "math_exact_match",
+                },
+                {
+                    "dataset": "gsm8k",
+                    "judge_score": 5,
+                    "task_correct": False,
+                    "task_metric_name": "math_exact_match",
+                },
             ],
             pass_score=7,
         )
 
-        self.assertEqual(summary["num_samples"], 3)
-        self.assertAlmostEqual(summary["average_score"], (8 + 6 + 9) / 3)
-        self.assertAlmostEqual(summary["accuracy"], 2 / 3)
+        self.assertEqual(summary["num_samples"], 4)
+        self.assertAlmostEqual(summary["average_score"], (8 + 6 + 9 + 5) / 4)
+        self.assertAlmostEqual(summary["judge_pass_rate"], 2 / 4)
+        self.assertAlmostEqual(summary["task_accuracy"], 1 / 2)
+        self.assertEqual(summary["task_accuracy_eligible_samples"], 2)
         self.assertIn("alpaca", summary["per_dataset"])
         self.assertEqual(summary["score_distribution"]["8"], 1)
+        self.assertEqual(summary["task_metric_distribution"]["math_exact_match"], 2)
 
 
 if __name__ == "__main__":

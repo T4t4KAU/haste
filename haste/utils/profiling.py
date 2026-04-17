@@ -210,6 +210,11 @@ def build_draft_worker_profile_summary(snapshot: dict[str, Any], *, device: str)
     transfer_d2h = snapshot.get("transfer_d2h_times", [])
     transfer_h2d_bytes = snapshot.get("transfer_h2d_bytes", [])
     transfer_d2h_bytes = snapshot.get("transfer_d2h_bytes", [])
+    populate_total = sum(snapshot.get("cache_populate_times", []))
+    populate_recovery = snapshot.get("populate_recovery_resolve_times", [])
+    populate_expand = snapshot.get("populate_branch_expand_times", [])
+    populate_model = snapshot.get("populate_branch_model_times", [])
+    populate_commit = snapshot.get("populate_cache_commit_times", [])
     return {
         "device": device,
         "request_wait_ms": summarize_numeric_series(snapshot["request_wait_times"], scale=1000.0),
@@ -226,6 +231,14 @@ def build_draft_worker_profile_summary(snapshot: dict[str, Any], *, device: str)
         "worker_total_ms": summarize_numeric_series(snapshot["worker_total_times"], scale=1000.0),
         "worker_serve_ms": summarize_numeric_series(snapshot["worker_serve_times"], scale=1000.0),
         "cache_populate_ms": summarize_numeric_series(snapshot["cache_populate_times"], scale=1000.0),
+        "populate_recovery_resolve_ms": summarize_numeric_series(populate_recovery, scale=1000.0),
+        "populate_recovery_resolve_share": safe_divide(sum(populate_recovery), populate_total),
+        "populate_branch_expand_ms": summarize_numeric_series(populate_expand, scale=1000.0),
+        "populate_branch_expand_share": safe_divide(sum(populate_expand), populate_total),
+        "populate_branch_model_ms": summarize_numeric_series(populate_model, scale=1000.0),
+        "populate_branch_model_share": safe_divide(sum(populate_model), populate_total),
+        "populate_cache_commit_ms": summarize_numeric_series(populate_commit, scale=1000.0),
+        "populate_cache_commit_share": safe_divide(sum(populate_commit), populate_total),
         "populate_branch_count": summarize_numeric_series(snapshot.get("populate_branch_counts", [])),
         "fast_populate_rate": safe_divide(
             sum(snapshot.get("fast_populate_flags", [])),

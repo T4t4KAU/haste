@@ -373,6 +373,19 @@ def print_series_summary(label: str, summary: dict[str, Any], unit: str = "") ->
     )
 
 
+def print_series_summary_with_share(
+    label: str,
+    summary: dict[str, Any],
+    share: float | None,
+    unit: str = "",
+) -> None:
+    """Print a series summary and its share of a parent stage."""
+    if summary.get("count", 0) == 0:
+        return
+    suffix = f" ({share:.2%} of populate)" if share is not None else ""
+    print_series_summary(f"{label}{suffix}", summary, unit)
+
+
 def print_profile_summary(report: dict[str, Any]) -> None:
     """Print profiling summary from the report.
     
@@ -444,6 +457,30 @@ def print_profile_summary(report: dict[str, Any]) -> None:
         print_series_summary("Draft wait for target", draft_worker.get("draft_wait_for_target_ms", {}), "ms")
         print_series_summary("Draft worker serve", draft_worker.get("worker_serve_ms", {}), "ms")
         print_series_summary("Draft cache populate", draft_worker.get("cache_populate_ms", {}), "ms")
+        print_series_summary_with_share(
+            "Populate recovery resolve",
+            draft_worker.get("populate_recovery_resolve_ms", {}),
+            draft_worker.get("populate_recovery_resolve_share"),
+            "ms",
+        )
+        print_series_summary_with_share(
+            "Populate branch expand",
+            draft_worker.get("populate_branch_expand_ms", {}),
+            draft_worker.get("populate_branch_expand_share"),
+            "ms",
+        )
+        print_series_summary_with_share(
+            "Populate branch model",
+            draft_worker.get("populate_branch_model_ms", {}),
+            draft_worker.get("populate_branch_model_share"),
+            "ms",
+        )
+        print_series_summary_with_share(
+            "Populate cache commit",
+            draft_worker.get("populate_cache_commit_ms", {}),
+            draft_worker.get("populate_cache_commit_share"),
+            "ms",
+        )
         print_series_summary("Effective lookahead", draft_worker.get("effective_lookahead", {}))
         print_series_summary("Effective fan-out cap", draft_worker.get("effective_fan_out_cap", {}))
         if draft_worker.get("fast_populate_rate") is not None:

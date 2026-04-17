@@ -130,6 +130,13 @@ def render_chat_prompt(messages: list[dict[str, Any]], tokenizer) -> str:
             raise APIError(HTTPStatus.BAD_REQUEST, f"`messages[{idx}].content` must be a string.")
         normalized_messages.append({"role": role, "content": content})
 
+    def _fallback_prompt() -> str:
+        prompt_lines = []
+        for message in normalized_messages:
+            prompt_lines.append(f"{message['role'].upper()}: {message['content']}")
+        prompt_lines.append("ASSISTANT:")
+        return "\n".join(prompt_lines)
+
     if hasattr(tokenizer, "apply_chat_template"):
         apply_chat_template = tokenizer.apply_chat_template
         kwargs: dict[str, Any] = {
@@ -158,13 +165,18 @@ def render_chat_prompt(messages: list[dict[str, Any]], tokenizer) -> str:
                 )
             except TypeError:
                 pass
-        return apply_chat_template(normalized_messages, **kwargs)
+            except ValueError as exc:
+                if "tokenizer.chat_template is not set" in str(exc):
+                    return _fallback_prompt()
+                raise
+        try:
+            return apply_chat_template(normalized_messages, **kwargs)
+        except ValueError as exc:
+            if "tokenizer.chat_template is not set" in str(exc):
+                return _fallback_prompt()
+            raise
 
-    prompt_lines = []
-    for message in normalized_messages:
-        prompt_lines.append(f"{message['role'].upper()}: {message['content']}")
-    prompt_lines.append("ASSISTANT:")
-    return "\n".join(prompt_lines)
+    return _fallback_prompt()
 
 
 def parse_prompt_inputs(body: dict[str, Any]) -> tuple[list[str | list[int]], bool]:

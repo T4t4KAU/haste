@@ -47,6 +47,16 @@ class CachedDraftState:
 
 
 @dataclass
+class PopulateProfile:
+    """Breakdown of async populate work for one worker iteration."""
+
+    recovery_resolve_sec: float = 0.0  # Fork recovery token resolution
+    branch_expand_sec: float = 0.0  # Building branch inputs/keys on CPU
+    branch_model_sec: float = 0.0  # Draft model compute for branch speculation
+    cache_commit_sec: float = 0.0  # Publishing populated branches into cache
+
+
+@dataclass
 class AutoTuneState:
     """Auto-tune state data class."""
     stage: str  # Current stage: 'search_k', 'search_f', or 'steady'
@@ -147,6 +157,10 @@ class DraftRunner(ModelRunner):
             "worker_total_times": [],
             "worker_serve_times": [],
             "cache_populate_times": [],
+            "populate_recovery_resolve_times": [],
+            "populate_branch_expand_times": [],
+            "populate_branch_model_times": [],
+            "populate_cache_commit_times": [],
             "populate_branch_counts": [],
             "fast_populate_flags": [],
             "request_batch_sizes": [],
@@ -1135,7 +1149,7 @@ class DraftRunner(ModelRunner):
         computed_indices: list[int],
         computed_all_logits: torch.Tensor | None,
         fork_overrides: dict[int, torch.Tensor],
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, bool, PopulateProfile]:
         """Populate next cache.
         
         Args:
@@ -1146,15 +1160,18 @@ class DraftRunner(ModelRunner):
             fork_overrides (dict[int, torch.Tensor]): Fork overrides
             
         Returns:
-            tuple[int, bool]: Number of branches and whether fast populate was used
+            tuple[int, bool, PopulateProfile]: Number of branches, whether fast
+                populate was used, and a per-stage timing breakdown
         """
+        profile = PopulateProfile()
         if not seqs:
             self._tree_cache.clear()
-            return 0, False
+            return 0, False, profile
 
         lookahead = response.lookahead
         fan_out_list, fan_out_list_miss = self._effective_fan_out_lists(len(seqs), lookahead)
 
+        stage_start = time.perf_counter()
         forked_recovery_tokens_by_idx: dict[int, list[int]] = {
             batch_idx: tokens.tolist()
             for batch_idx, tokens in fork_overrides.items()
@@ -1179,7 +1196,9 @@ class DraftRunner(ModelRunner):
                 forked_recovery_tokens_by_idx[batch_idx] = self._worker_tensor_to_list(
                     computed_forked_recovery_tokens[local_idx]
                 )
+        profile.recovery_resolve_sec = time.perf_counter() - stage_start
 
+        stage_start = time.perf_counter()
         branch_token_batches: list[list[int]] = []
         branch_recovery_tokens: list[int] = []
         branch_temperatures: list[float] = []
@@ -1202,10 +1221,11 @@ class DraftRunner(ModelRunner):
                     branch_token_batches.append(base_tokens)
                     branch_recovery_tokens.append(recovery_token)
                     branch_temperatures.append(temperature)
+        profile.branch_expand_sec = time.perf_counter() - stage_start
 
         if not branch_keys:
             self._tree_cache.clear()
-            return 0, False
+            return 0, False, profile
 
         use_fast_populate = self._should_use_fast_populate(
             batch_size=len(seqs),
@@ -1214,6 +1234,7 @@ class DraftRunner(ModelRunner):
             branch_temperatures=branch_temperatures,
         )
 
+        stage_start = time.perf_counter()
         if use_fast_populate:
             branch_specs, branch_fork_recovery_tokens = self._speculate_low_latency_miss_batch(
                 branch_token_batches,
@@ -1257,7 +1278,9 @@ class DraftRunner(ModelRunner):
                 lookahead=lookahead,
             )
             branch_fork_recovery_tokens = self._to_cpu_pinned(branch_fork_recovery_tokens)
+        profile.branch_model_sec = time.perf_counter() - stage_start
 
+        stage_start = time.perf_counter()
         branch_specs_cpu = self._to_cpu_pinned(branch_specs)
         gpu_cache = branch_specs if self._should_keep_gpu_cache(branch_specs) else None
         self._tree_cache = {
@@ -1270,7 +1293,8 @@ class DraftRunner(ModelRunner):
             )
             for idx, key in enumerate(branch_keys)
         }
-        return len(branch_keys), use_fast_populate
+        profile.cache_commit_sec = time.perf_counter() - stage_start
+        return len(branch_keys), use_fast_populate, profile
 
     def _draft_loop(self):
         """Draft loop for asynchronous operation."""
@@ -1312,7 +1336,7 @@ class DraftRunner(ModelRunner):
                 response.serve_ms = serve_elapsed * 1000.0
                 request.response_q.put(response)
                 populate_start = time.perf_counter()
-                populate_branch_count, used_fast_populate = self._populate_next_cache(
+                populate_branch_count, used_fast_populate, populate_profile = self._populate_next_cache(
                     request.seqs,
                     response,
                     computed_indices,
@@ -1325,6 +1349,18 @@ class DraftRunner(ModelRunner):
                 self._worker_profile["worker_total_times"].append(total_elapsed)
                 self._worker_profile["worker_serve_times"].append(serve_elapsed)
                 self._worker_profile["cache_populate_times"].append(populate_elapsed)
+                self._worker_profile["populate_recovery_resolve_times"].append(
+                    populate_profile.recovery_resolve_sec
+                )
+                self._worker_profile["populate_branch_expand_times"].append(
+                    populate_profile.branch_expand_sec
+                )
+                self._worker_profile["populate_branch_model_times"].append(
+                    populate_profile.branch_model_sec
+                )
+                self._worker_profile["populate_cache_commit_times"].append(
+                    populate_profile.cache_commit_sec
+                )
                 self._worker_profile["populate_branch_counts"].append(populate_branch_count)
                 self._worker_profile["fast_populate_flags"].append(1 if used_fast_populate else 0)
                 self._worker_profile["worker_batch_sizes"].append(len(request.seqs))

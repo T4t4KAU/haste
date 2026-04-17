@@ -130,12 +130,21 @@ def render_messages(messages: list[dict[str, str]], tokenizer, *, system_prompt:
         not formatted_messages or formatted_messages[0].get("role") != "system"
     ):
         formatted_messages = [{"role": "system", "content": system_prompt}] + formatted_messages
-    if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            formatted_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+    chat_template = getattr(tokenizer, "chat_template", None)
+    has_chat_template = bool(chat_template) if not isinstance(chat_template, dict) else bool(chat_template)
+    if hasattr(tokenizer, "apply_chat_template") and has_chat_template:
+        try:
+            return tokenizer.apply_chat_template(
+                formatted_messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except ValueError as exc:
+            # Some tokenizer configs expose apply_chat_template without shipping a
+            # usable template. For plain text generation tasks, fall back to a
+            # simple role-tagged prompt instead of failing hard.
+            if "tokenizer.chat_template is not set" not in str(exc):
+                raise
     formatted = []
     for message in formatted_messages:
         role = message.get("role", "user")

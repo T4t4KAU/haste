@@ -21,6 +21,13 @@ class _TokenizerWithoutTemplate:
     pass
 
 
+class _TokenizerMissingTemplateConfig:
+    def apply_chat_template(self, messages, **kwargs):
+        raise ValueError(
+            "Cannot use chat template functions because tokenizer.chat_template is not set and no template argument was passed!"
+        )
+
+
 class ServerHelpersTest(unittest.TestCase):
     def test_parse_prompt_inputs_supports_single_prompt(self):
         prompts, is_single = haste_server.parse_prompt_inputs({"prompt": "hello"})
@@ -85,6 +92,16 @@ class ServerHelpersTest(unittest.TestCase):
                 {"role": "user", "content": "Hello"},
             ],
             _TokenizerWithoutTemplate(),
+        )
+
+        self.assertEqual(prompt, "USER: Hello\nASSISTANT:")
+
+    def test_render_chat_prompt_falls_back_when_chat_template_missing(self):
+        prompt = haste_server.render_chat_prompt(
+            [
+                {"role": "user", "content": "Hello"},
+            ],
+            _TokenizerMissingTemplateConfig(),
         )
 
         self.assertEqual(prompt, "USER: Hello\nASSISTANT:")
